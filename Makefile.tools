@@ -1,0 +1,24 @@
+HOSTCC ?= gcc
+FFMPEG ?= ffmpeg
+V810GCC ?=/opt/v810-gcc
+PREFIX ?= v810
+
+OBJDIR := build
+PCFV_ENCODE := $(OBJDIR)/pcfv_encode
+
+.PHONY: all tools 
+all: tools
+
+tools: $(PCFV_ENCODE) tools/pcfxtools/pcfx-cdlink
+
+$(OBJDIR):
+	mkdir -p $(OBJDIR)
+
+$(PCFV_ENCODE): tools/pcfv_encode.c tools/rainbow_yuvdct_encode.c tools/wav2vox/adpcmoki.c | $(OBJDIR)
+	$(HOSTCC) -O2 -Wall -Wextra -std=c99 -Iinclude -Itools/wav2vox \
+		tools/pcfv_encode.c tools/wav2vox/adpcmoki.c -lz -lm -pthread -o $@
+
+tools/pcfxtools/pcfx-cdlink: tools/pcfxtools/pcfx-cdlink.c tools/pcfxtools/boot.h
+	$(MAKE) -C tools/pcfxtools CC=$(HOSTCC) pcfx-cdlink
+clean:
+	rm -rf $(OBJDIR)

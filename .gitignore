@@ -1,0 +1,9 @@
+data/*.mkv
+*.o
+build
+*.bin
+*.cue
+src/*.o
+*.zip
+*.pcfv
+*.mp2
