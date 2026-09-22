@@ -692,10 +692,11 @@ static void set_rainbow_visible(uint8_t visible) {
     g_rainbow_visible = visible ? 1 : 0;
 }
 
-/* Interrupt-atomic KING register runs.  Not libpcfx's irq_disable()/
-   irq_restore(): irq_disable() returns the raw PSW.ID bit (0x1000) and writes
+/* Interrupt-atomic KING register runs.  Kept local so the player is correct
+   with any libpcfx: liberis, and libpcfx before its 012_irq_save_restore fix,
+   return the raw PSW.ID bit (0x1000) from irq_disable() and write
    PSW = 0x1000, while irq_restore() keeps only bit 0 of its argument, so
-   irq_restore(irq_disable()) always leaves interrupts ENABLED
+   irq_restore(irq_disable()) always left interrupts ENABLED
    (vendor/libpcfx/src/v810.S).  Here that switched IRQs on at the first
    RAINBOW latch of builds that install no handler (ADPCM, silent), and a
    stray interrupt overwrote the stream index in RAM; MP2 builds only worked
