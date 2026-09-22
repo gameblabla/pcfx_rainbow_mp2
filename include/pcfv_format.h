@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* PCFV: PC-FX full-motion stream for HuC6271 RAINBOW + HuC6230 ADPCM.
+/* PCFV: PC-FX full-motion stream for HuC6271 RAINBOW + HuC6230 ADPCM or MP2.
 
    All multi-byte fields are little-endian on disc.  Units named "sector" are
    2048-byte CD sectors relative to the beginning of the PCFV file, not absolute
@@ -13,10 +13,15 @@
      64-byte PCFV header
      frame_count * 32-byte PCFV frame entries
      zero padding to data_start_sector
-     ADPCM preroll sectors
+     ADPCM preroll sectors (ADPCM streams only)
      for each frame:
        one padded RAINBOW YUV/DCT frame
-       optional padded ADPCM refill chunk
+       optional padded audio chunk (ADPCM refill block or MP2 bytes)
+
+   ADPCM streams (flags bit0) are cut in 65536-byte blocks, one KRAM ring half
+   each: blocks 0-1 are the preroll, block k >= 2 is one refill chunk.  MP2
+   streams (flags bit1) carry 1-4 sector chunks and no preroll.  Writers:
+   tools/rainbow/pcfv.py (silent, MP2), tools/pcfv_adpcm.py (ADPCM).
 */
 
 #define PCFV_MAGIC        "PCFV0001"
@@ -33,7 +38,7 @@
 #define PCFV_HDR_FPS_NUM            12u  /* u16 */
 #define PCFV_HDR_FPS_DEN            14u  /* u16 */
 #define PCFV_HDR_FRAME_COUNT        16u  /* u16 */
-#define PCFV_HDR_FLAGS              18u  /* u16, bit0: ADPCM present */
+#define PCFV_HDR_FLAGS              18u  /* u16, bit0: ADPCM, bit1: MP2 */
 #define PCFV_HDR_INDEX_BYTES        20u  /* u32 */
 #define PCFV_HDR_DATA_START_SECTOR  24u  /* u32 */
 #define PCFV_HDR_MAX_VIDEO_SECTORS  28u  /* u32 */

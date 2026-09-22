@@ -439,7 +439,10 @@ static void PSG10MP2_InitTimerWithHandler(int period, uint32_t frac_16_16, void 
 {
     irq_set_mask(0x7F);
     irq_set_raw_handler(0x9, handler);
-    irq_set_mask(0x37);
+    /* Unmask the timer only (mask bit 7 - source; timer = source 1).  0x37
+       also unmasked VDC-A, whose pending IRQ ran a BIOS handler that left the
+       RAINBOW black once interrupts were really enabled here. */
+    irq_set_mask(0x3F);
     if (period <= 0) period = 90;
     g_mp2psg10_timer_period_base = (uint32_t)period;
     g_mp2psg10_timer_period_frac = frac_16_16;

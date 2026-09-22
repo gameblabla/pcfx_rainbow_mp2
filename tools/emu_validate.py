@@ -8,7 +8,10 @@ this package has actually shipped:
 
   * black screen / hung boot  -> no frames presented, screenshot all black
   * RAINBOW starvation        -> right-edge band far worse than the body
-  * CD or audio underflows    -> non-zero underflow/error counters
+  * CD or audio underflows    -> non-zero underflow/error counters (MP2: PSG
+                                 ring; ADPCM: a ring half played before its
+                                 refill landed, or out-of-order half events)
+  * silent build by accident  -> the stream has audio the player did not take
   * clip never finishes       -> g_done != 1 at the final checkpoint
 
 With --source it also runs regression_check.py (A/V drift, pitch, start-up
@@ -79,6 +82,8 @@ def main():
                     help='emulated frame counts to screenshot + dump (must fall inside playback)')
     ap.add_argument('--final', type=int, default=3000, help='frame count by which playback must be done')
     ap.add_argument('--out', default='validation/current')
+    ap.add_argument('--max-adpcm-clock-error', type=int, default=1048,
+                    help='samples (2 fields at 31.47 kHz) between the field-count clock and the hardware half events')
     a = ap.parse_args()
     if not a.bios_dir:
         raise SystemExit('set PCFX_BIOS_DIR or pass --bios-dir (a BIOS is never bundled)')
@@ -104,13 +109,22 @@ def main():
         img = load_rgb(png)
         lit = nonblack_fraction(img)
         seam, hf = right_edge_starvation(img)
+        adpcm = 'g_adpcm_underruns' in st
+        audio = (f'adpcm_underruns={st.get("g_adpcm_underruns")} refills={st.get("g_adpcm_refills")} '
+                 f'clock_err={st.get("g_adpcm_clock_error_max")}' if adpcm else
+                 f'psg_underflows={st.get("g_mp2psg10_underflows")}')
         print(f'{n:5d} frames: presented={shown} done={st.get("g_done")} nonblack={lit:.2f} '
               f'edge_seam={seam:.2f} edge_hf={hf:.2f} '
               f'video_underflows={st.get("g_scsi_dma_video_underflows")} dma_errors={st.get("g_scsi_dma_errors")} '
-              f'psg_underflows={st.get("g_mp2psg10_underflows")}')
-        for key in ('g_scsi_dma_video_underflows', 'g_scsi_dma_errors', 'g_mp2psg10_underflows', 'g_abort'):
+              + audio)
+        for key in ('g_scsi_dma_video_underflows', 'g_scsi_dma_errors', 'g_mp2psg10_underflows', 'g_abort',
+                    'g_adpcm_underruns', 'g_adpcm_parity_errors'):
             if st.get(key):
                 failures.append(f'{n}: {key}={st[key]}')
+        if adpcm and st.get('g_adpcm_clock_error_max', 0) > a.max_adpcm_clock_error:
+            failures.append(f'{n}: ADPCM field clock off the hardware by {st["g_adpcm_clock_error_max"]} samples')
+        if st.get('g_audio_codec') and 'g_audio_active' in st and not st['g_audio_active']:
+            failures.append(f'{n}: stream has audio (codec {st["g_audio_codec"]}) but the player plays it silently')
         if final:
             if st.get('g_done') != 1:
                 failures.append(f'{n}: playback not finished (g_done={st.get("g_done")}, presented={shown})')
