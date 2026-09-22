@@ -50,8 +50,8 @@ uint32_t pcfx_mp2_frame_size(const uint8_t *frame)
     }
 }
 
-/* liberis' eris_cd_read path can clobber callee-saved registers with this
-   toolchain/liberis combination. Save the live register set around it. */
+/* libpcfx's eris_cd_read() (<eris/cd.h>) can clobber callee-saved registers
+   with this toolchain. Save the live register set around it. */
 static uint32_t pcfx_cd_read_safe(uint32_t lba, uint8_t *buf, uint32_t size)
 {
     uint32_t ret;

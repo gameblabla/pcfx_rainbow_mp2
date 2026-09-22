@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* PC-FX pad bits as returned by liberis eris_pad_read(0). */
+/* PC-FX pad bits as returned by libpcfx contrlr_pad_read(0). */
 #define PCFX_PCFV_BTN_I      (1u << 0)
 #define PCFX_PCFV_BTN_II     (1u << 1)
 #define PCFX_PCFV_BTN_III    (1u << 2)
