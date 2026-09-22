@@ -28,9 +28,10 @@
                     after the header/index area.
 
    The seek lands on the first RAINBOW frame whose on-disc sector is >= the
-   requested sector.  ADPCM is re-primed from the closest available ADPCM refill
-   chunk; exact random-access audio requires authoring clip/keyframe boundaries
-   at valid ADPCM reset points. */
+   requested sector, and the audio is primed for that frame.  MP2 restarts at
+   the target frame's MP2 frame (Layer II frames decode independently).  ADPCM
+   restarts at the 512-byte point at or before it (<= 32 ms early) with a reset
+   decoder: exact at frame 0, a short predictor-settling transient elsewhere. */
 #define PCFX_PCFV_SEEK_NONE          0u
 #define PCFX_PCFV_SEEK_STREAM_SECTOR 1u
 #define PCFX_PCFV_SEEK_DISC_LBA      2u
@@ -98,8 +99,8 @@ int  pcfx_pcfv_paused(void);
 
 /* Runtime seek helpers for the flexible API.  They keep the current frame on
    screen while the new target is asynchronously prebuffered.  Audio is stopped,
-   re-primed from the nearest PCFV ADPCM chunk, then restarted after the first
-   new video frame is latched.  Return 1 if the seek request was accepted. */
+   re-primed for the target frame (see above), then restarted on the target
+   frame's first visible field.  Return 1 if the seek request was accepted. */
 int  pcfx_pcfv_seek_frame(uint16_t frame_index);
 int  pcfx_pcfv_seek_stream_sector(uint32_t stream_relative_sector);
 int  pcfx_pcfv_seek_disc_lba(uint32_t absolute_disc_lba);
@@ -115,9 +116,10 @@ uint16_t pcfx_pcfv_frame_for_stream_sector(uint32_t stream_relative_sector);
 uint16_t pcfx_pcfv_frame_for_disc_lba(uint32_t absolute_disc_lba);
 uint16_t pcfx_pcfv_frame_for_data_sector(uint32_t data_relative_sector);
 
-/* Optional RAINBOW+MP2 path. Load the MP2 asset from CD into CPU RAM before
-   opening the PCFV stream, then the player decodes it cooperatively while the
-   RAINBOW stream continues to use KING DMA from CD. */
+/* MP2 builds (AUDIO=mp2) only; other builds return 0.  Streams carry their
+   own interleaved audio.  pcfx_pcfv_mp2_load_from_cd() instead preloads a
+   separate MP2 asset into RAM (libpcfx eris_cd_read_dma, CD -> KRAM -> RAM)
+   before opening a silent PCFV; the player then decodes it cooperatively. */
 int pcfx_pcfv_mp2_load_from_cd(uint32_t mp2_lba, uint32_t mp2_size_bytes);
 uint32_t pcfx_pcfv_mp2_frames_decoded(void);
 uint32_t pcfx_pcfv_mp2_underflows(void);

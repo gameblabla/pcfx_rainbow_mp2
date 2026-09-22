@@ -24,9 +24,12 @@ def u16(name):
     a,s=syms[name]; return struct.unpack_from('<H', ram, a)[0]
 def u32(name):
     a,s=syms[name]; return struct.unpack_from('<I', ram, a)[0]
-keys32=['g_video_frames_presented','g_video_frames_skipped','g_video_frames_held','g_video_frames_dropped_stale','g_vblank_latched_frames','g_midfield_latched_frames','g_scsi_dma_video_underflows','g_scsi_dma_late_frames','g_scsi_dma_errors','g_scsi_dma_completed','g_scsi_dma_started','g_video_ready_highwater','g_audio_start_latch_frame','g_audio_start_visible_fields','g_audio_start_ring_used','g_audio_start_samples_emitted','g_mp2_preroll_ring_at_exit','g_mp2_preroll_guard_count','g_rainbow_visible_fields','g_mp2_sync_pauses','g_mp2_sync_resumes']
-keys16=['g_frame_count','g_next_display_frame','g_next_load_frame','g_fields_per_frame','g_field_counter','g_audio_chunk_count','g_next_audio_chunk']
-keys8=['g_done','g_abort','g_header_ready','g_rainbow_visible','g_audio_codec','g_mp2_enabled']
+keys32=['g_video_frames_presented','g_video_frames_skipped','g_video_frames_held','g_video_frames_dropped_stale','g_vblank_latched_frames','g_midfield_latched_frames','g_scsi_dma_video_underflows','g_scsi_dma_late_frames','g_scsi_dma_errors','g_scsi_dma_completed','g_scsi_dma_started','g_video_ready_highwater','g_audio_start_latch_frame','g_audio_start_visible_fields','g_audio_start_ring_used','g_audio_start_samples_emitted','g_mp2_preroll_ring_at_exit','g_mp2_preroll_guard_count','g_rainbow_visible_fields','g_mp2_sync_pauses','g_mp2_sync_resumes','g_audio_clock_samples',
+        'g_adpcm_underruns','g_adpcm_refills','g_adpcm_boundaries','g_adpcm_parity_errors','g_adpcm_clock_error_max',
+        'g_adpcm_play_block','g_adpcm_requests']
+keys16=['g_frame_count','g_start_frame','g_next_display_frame','g_next_load_frame','g_fields_per_frame','g_field_counter','g_audio_chunk_count','g_next_audio_chunk']
+keys8=['g_done','g_abort','g_header_ready','g_rainbow_visible','g_audio_codec','g_audio_active','g_mp2_enabled',
+       'g_adpcm_enabled','g_adpcm_started','g_adpcm_playing','g_adpcm_finished','g_paused']
 out={}
 for k in keys32:
     if k in syms: out[k]=u32(k)

@@ -1,14 +1,14 @@
 #include <stdint.h>
 #include <string.h>
 #include <pcfx/v810.h>
+#include <pcfx/king.h>
 #include <eris/cd.h>
-#include <eris/scsi.h>
 #include "pcfx_mp2_async.h"
 #include "psg_sample.h"
 
 uint8_t g_pcfx_mp2_preload_buf[PCFX_MP2_PRELOAD_MAX_BYTES] __attribute__((aligned(2048)));
-static uint8_t g_mp2_stream_buf[PCFX_MP2_STREAM_BUF_BYTES] __attribute__((aligned(4)));
-static uint8_t g_mp2_chunk_tmp[PCFX_MP2_STREAM_CHUNK_MAX_SECTORS * 2048u] __attribute__((aligned(2048)));
+/* + one chunk of slack: CD reads land whole sectors past the last byte. */
+static uint8_t g_mp2_stream_buf[PCFX_MP2_STREAM_BUF_BYTES + PCFX_MP2_STREAM_CHUNK_MAX_SECTORS * 2048u] __attribute__((aligned(4)));
 static kjmp2v_psg10_sample_t g_mp2_frame_tmp[KJMP2_SAMPLES_PER_FRAME] __attribute__((aligned(4)));
 
 static uint32_t mp2_ring_used_fast(void) { return g_mp2psg10_write_pos - g_mp2psg10_read_pos; }
@@ -50,43 +50,23 @@ uint32_t pcfx_mp2_frame_size(const uint8_t *frame)
     }
 }
 
-/* libpcfx's eris_cd_read() (<eris/cd.h>) can clobber callee-saved registers
-   with this toolchain. Save the live register set around it. */
-static uint32_t pcfx_cd_read_safe(uint32_t lba, uint8_t *buf, uint32_t size)
+/* CD -> KRAM -> RAM through libpcfx: eris_cd_read_dma() issues count-0 KING
+   SCSI-DMA arms into the KRAM window and copies each piece out, the path
+   <eris/cd.h> documents as the supported CD-to-RAM read (the CPU-PIO
+   eris_cd_read() is its real-hardware fallback).  The window is on the page
+   REG.0F routes SCSI to, so route page 0 first; the player re-initializes
+   KING when it opens a stream. */
+static int pcfx_mp2_cd_read_ram(uint32_t lba, uint8_t *buf, uint32_t size)
 {
-    uint32_t ret;
-    __asm__ volatile (
-        "addi -20, sp, sp\n"
-        "st.w r16, 0[sp]\n"
-        "st.w r17, 4[sp]\n"
-        "st.w r18, 8[sp]\n"
-        "st.w r19, 12[sp]\n"
-        "st.w lp, 16[sp]\n"
-        "mov %1, r6\n"
-        "mov %2, r7\n"
-        "mov %3, r8\n"
-        "jal _eris_cd_read\n"
-        "mov r10, %0\n"
-        "ld.w 0[sp], r16\n"
-        "ld.w 4[sp], r17\n"
-        "ld.w 8[sp], r18\n"
-        "ld.w 12[sp], r19\n"
-        "ld.w 16[sp], lp\n"
-        "addi 20, sp, sp\n"
-        : "=r"(ret)
-        : "r"(lba), "r"(buf), "r"(size)
-        : "r6", "r7", "r8", "r10", "r11", "r12", "r13", "r14", "r15", "memory"
-    );
-    return ret;
+    king_set_kram_mode(1);
+    king_set_kram_pages(0, 0, 0, 0);
+    return eris_cd_read_dma(lba, buf, size, PCFX_MP2_KRAM_WORD_ADDR, PCFX_MP2_KRAM_WORDS);
 }
 
 int pcfx_mp2_load_cd(uint32_t lba, uint32_t size_bytes)
 {
-    uint32_t rounded;
     if (!lba || !size_bytes || size_bytes > PCFX_MP2_PRELOAD_MAX_BYTES) return 0;
-    rounded = (size_bytes + 2047u) & ~2047u;
-    scsi_reset();
-    return pcfx_cd_read_safe(lba, g_pcfx_mp2_preload_buf, rounded) ? 1 : 0;
+    return pcfx_mp2_cd_read_ram(lba, g_pcfx_mp2_preload_buf, size_bytes);
 }
 
 static int pcfx_mp2_init_decoder_from_header(PcfxMp2Async *s, const uint8_t *src)
@@ -135,13 +115,23 @@ static void pcfx_mp2_stream_compact(PcfxMp2Async *s)
 
 int pcfx_mp2_stream_begin(PcfxMp2Async *s, uint32_t total_size_bytes)
 {
-    if (!s || total_size_bytes < 4u) return 0;
+    return pcfx_mp2_stream_begin_at(s, total_size_bytes, 0u, 0u);
+}
+
+int pcfx_mp2_stream_begin_at(PcfxMp2Async *s, uint32_t total_size_bytes,
+                             uint32_t byte_offset, uint32_t skip_to_frame)
+{
+    if (!s || total_size_bytes < 4u || byte_offset >= total_size_bytes) return 0;
     memset(s, 0, sizeof(*s));
     s->src = g_mp2_stream_buf;
     s->pos = g_mp2_stream_buf;
     s->end = g_mp2_stream_buf;
     s->size = total_size_bytes;
     s->stream_mode = 1u;
+    s->bytes_loaded = byte_offset;
+    s->bytes_consumed = byte_offset;
+    s->need_sync = byte_offset ? 1u : 0u;
+    s->skip_to_frame = skip_to_frame;
     return 1;
 }
 
@@ -160,54 +150,102 @@ uint32_t pcfx_mp2_stream_free_bytes(PcfxMp2Async *s)
     return (used < PCFX_MP2_STREAM_BUF_BYTES) ? (PCFX_MP2_STREAM_BUF_BYTES - used) : 0u;
 }
 
+uint8_t *pcfx_mp2_stream_tail(PcfxMp2Async *s, uint32_t room_bytes)
+{
+    uint32_t real;
+    if (!s || !s->stream_mode) return 0;
+    real = s->size - s->bytes_loaded;
+    if (real > room_bytes) real = room_bytes;
+    /* A sector-rounded CD read may run past the stream's last byte; the
+       buffer's one-chunk slack absorbs that, so only real bytes must fit. */
+    if (room_bytes - real > PCFX_MP2_STREAM_CHUNK_MAX_SECTORS * 2048u) return 0;
+    if (pcfx_mp2_stream_free_bytes(s) < real) return 0;
+    return (uint8_t *)s->end;
+}
+
+int pcfx_mp2_stream_commit(PcfxMp2Async *s, uint32_t byte_offset, uint32_t bytes)
+{
+    if (!s || !s->stream_mode || byte_offset != s->bytes_loaded) return 0;
+    if (byte_offset + bytes > s->size) bytes = s->size - byte_offset;
+    s->end += bytes;
+    s->bytes_loaded += bytes;
+    if (s->bytes_loaded >= s->size) s->input_eof = 1u;
+    return 1;
+}
+
 int pcfx_mp2_stream_append_bytes(PcfxMp2Async *s, uint32_t byte_offset, const uint8_t *data, uint32_t bytes)
 {
-    uint32_t free_bytes;
-    if (!s || !s->stream_mode || !data) return 0;
-    if (byte_offset != s->bytes_loaded) return 0;
+    uint8_t *dst;
+    if (!s || !s->stream_mode || !data || byte_offset != s->bytes_loaded) return 0;
     if (byte_offset + bytes > s->size) bytes = s->size - byte_offset;
-    free_bytes = pcfx_mp2_stream_free_bytes(s);
-    if (free_bytes < bytes) return 0;
-    if (bytes) {
-        memcpy((void *)s->end, data, bytes);
-        s->end += bytes;
-        s->bytes_loaded += bytes;
-    }
-    if (s->bytes_loaded >= s->size) s->input_eof = 1u;
-    if (!s->opened && (uint32_t)(s->end - s->pos) >= 4u) {
-        if (!pcfx_mp2_init_decoder_from_header(s, s->pos)) {
-            s->done = 1u;
-            return 0;
-        }
-    }
-    return 1;
+    dst = pcfx_mp2_stream_tail(s, bytes);
+    if (!dst) return 0;
+    if (bytes) memcpy(dst, data, bytes);
+    return pcfx_mp2_stream_commit(s, byte_offset, bytes);
 }
 
 int pcfx_mp2_stream_read_cd(PcfxMp2Async *s, uint32_t lba, uint32_t byte_offset, uint32_t sectors)
 {
-    uint32_t read_bytes;
-    uint32_t real_bytes;
-    uint32_t free_bytes;
+    uint8_t *dst;
     if (!s || !s->stream_mode || !lba || !sectors || sectors > PCFX_MP2_STREAM_CHUNK_MAX_SECTORS) return 0;
     if (byte_offset != s->bytes_loaded) return 0;
-    read_bytes = sectors * 2048u;
-    real_bytes = read_bytes;
-    if (byte_offset + real_bytes > s->size) real_bytes = s->size - byte_offset;
-    free_bytes = pcfx_mp2_stream_free_bytes(s);
-    if (free_bytes < real_bytes) return 0;
-    scsi_reset();
-    if (!pcfx_cd_read_safe(lba, g_mp2_chunk_tmp, read_bytes)) {
-        scsi_reset();
-        return 0;
+    dst = pcfx_mp2_stream_tail(s, sectors * 2048u);
+    if (!dst || !pcfx_mp2_cd_read_ram(lba, dst, sectors * 2048u)) return 0;
+    return pcfx_mp2_stream_commit(s, byte_offset, sectors * 2048u);
+}
+
+/* After a mid-stream begin: advance to a frame header that is followed by
+   another header (or by the end of the stream).  Returns 0 to wait for data. */
+static int pcfx_mp2_resync(PcfxMp2Async *s)
+{
+    while ((uint32_t)(s->end - s->pos) >= 4u) {
+        uint32_t fsz = pcfx_mp2_frame_size(s->pos);
+        if (fsz && fsz <= KJMP2_MAX_FRAME_SIZE) {
+            int confirmed;
+            if ((uint32_t)(s->end - s->pos) < fsz + 4u) {
+                if (!s->input_eof) return 0;
+                confirmed = 1;
+            } else {
+                confirmed = pcfx_mp2_frame_size(s->pos + fsz) != 0u;
+            }
+            if (confirmed) {
+                /* CBR Layer II: frame index from the byte offset (exact when the
+                   stream has no padding frames, as the 16 kHz/32 kbit encode). */
+                uint32_t nominal = fsz - ((s->pos[2] >> 1) & 1u);
+                s->first_frame = (s->bytes_consumed + nominal / 2u) / nominal;
+                s->need_sync = 0u;
+                return 1;
+            }
+        }
+        s->pos++;
+        s->bytes_consumed++;
     }
-    scsi_reset();
-    return pcfx_mp2_stream_append_bytes(s, byte_offset, g_mp2_chunk_tmp, real_bytes);
+    return 0;
 }
 
 uint32_t pcfx_mp2_async_update(PcfxMp2Async *s, uint32_t frame_budget)
 {
     uint32_t decoded = 0;
     if (!s || s->done || frame_budget == 0u) return 0;
+    if (s->need_sync && !pcfx_mp2_resync(s)) {
+        if (s->input_eof) {
+            s->done = 1u;
+            PSG10MP2_SetDecodeDone();
+        }
+        return 0;
+    }
+    while (s->first_frame < s->skip_to_frame && (uint32_t)(s->end - s->pos) >= 4u) {
+        uint32_t fsz = pcfx_mp2_frame_size(s->pos);
+        if (!fsz || fsz > KJMP2_MAX_FRAME_SIZE) {
+            s->need_sync = 1u;
+            return 0;
+        }
+        if (s->pos + fsz > s->end) break;
+        s->pos += fsz;
+        s->bytes_consumed += fsz;
+        s->first_frame++;
+    }
+    if (s->first_frame < s->skip_to_frame && !s->input_eof) return 0;
     if (!s->opened) {
         if ((uint32_t)(s->end - s->pos) < 4u) return 0;
         if (!pcfx_mp2_init_decoder_from_header(s, s->pos)) {
@@ -301,4 +339,8 @@ uint32_t pcfx_mp2_async_underflows(void) { return PSG10MP2_GetUnderflows(); }
 uint32_t pcfx_mp2_async_ring_used(void) { return mp2_ring_used_fast(); }
 
 uint32_t pcfx_mp2_async_samples_emitted(void) { return g_mp2psg10_read_pos; }
+uint32_t pcfx_mp2_async_clock(const PcfxMp2Async *s)
+{
+    return (s ? s->first_frame * KJMP2_SAMPLES_PER_FRAME : 0u) + g_mp2psg10_read_pos;
+}
 int pcfx_mp2_async_playing(void) { return PSG10MP2_IsPlaying() ? 1 : 0; }

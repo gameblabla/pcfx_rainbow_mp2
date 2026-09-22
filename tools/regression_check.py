@@ -109,6 +109,46 @@ def best_envelope_scale(ref:np.ndarray, ref_sr:int, emu:np.ndarray, emu_sr:int, 
         raise SystemExit('could not match emulator WAV to reference envelope')
     return best
 
+def _xcorr_peak(hay:np.ndarray, needle:np.ndarray) -> Tuple[int,float]:
+    """Best normalized cross-correlation lag of needle inside hay (FFT)."""
+    n=len(hay)+len(needle)
+    size=1<<(n-1).bit_length()
+    nd=needle-float(np.mean(needle))
+    c=np.fft.irfft(np.fft.rfft(hay,size)*np.conj(np.fft.rfft(nd,size)),size)[:len(hay)-len(needle)+1]
+    csum=np.concatenate(([0.0],np.cumsum(hay*hay)))
+    energy=csum[len(needle):]-csum[:len(hay)-len(needle)+1]
+    score=c/np.sqrt(np.maximum(energy,1e-9)*float(np.dot(nd,nd))+1e-9)
+    k=int(np.argmax(score))
+    return k, float(score[k])
+
+def anchor_time_scale(ref:np.ndarray, emu:np.ndarray, sr:int, min_start_sec:float=8.0) -> Dict:
+    """Playback rate from two sample-precise anchors, both signals at one rate.
+    The reference is placed in the capture by envelope correlation (+-50 ms),
+    then the most dynamic 1 s window of its first and last third is re-found in
+    the capture by waveform correlation.  Their spacing over the reference
+    spacing is the time scale (~0.001 % over 20 s).  Unlike active-segment
+    spans this does not depend on level thresholds, which split differently
+    for a 4-bit ADPCM capture than for the source."""
+    hop=int(sr*0.01)
+    env=lambda x: np.sqrt((x[:len(x)//hop*hop].reshape(-1,hop)**2).mean(axis=1))
+    z=lambda v: (v-float(np.mean(v)))/(float(np.std(v))+1e-9)
+    re, ee=env(ref), env(emu)
+    start=int(min_start_sec/0.01)
+    if len(re) < 1000 or len(ee)-start < len(re):
+        raise SystemExit('capture too short for the anchor pitch check')
+    base=start+_xcorr_peak(z(ee[start:]), z(re))[0]
+    win=100
+    anchors=[]
+    for lo_f, hi_f in ((0.0, 0.35), (0.65, 1.0)):
+        cands=range(int(len(re)*lo_f), int(len(re)*hi_f)-win, 10)
+        a=max(cands, key=lambda i: float(np.std(re[i:i+win]))/(float(np.mean(re[i:i+win]))+1e-9))
+        needle=ref[a*hop:(a+win)*hop]
+        lo=max(0,(base+a)*hop-int(0.15*sr)); hi=min(len(emu),(base+a+win)*hop+int(0.15*sr))
+        k,score=_xcorr_peak(emu[lo:hi], needle)
+        anchors.append(dict(ref_sec=a*hop/sr, emu_sec=(lo+k)/sr, correlation=score))
+    scale=(anchors[1]['emu_sec']-anchors[0]['emu_sec'])/(anchors[1]['ref_sec']-anchors[0]['ref_sec'])
+    return dict(time_scale=scale, offset_sec=base*0.01, anchors=anchors)
+
 def compare_wav_to_reference(wav_path:pathlib.Path, source:pathlib.Path, expected_sr:int=16000) -> Dict:
     ref=run_ffmpeg_audio(source, expected_sr)
     ref_dur=len(ref)/expected_sr
@@ -147,8 +187,19 @@ def compare_wav_to_reference(wav_path:pathlib.Path, source:pathlib.Path, expecte
         scale=best_envelope_scale(ref, expected_sr, emu, emu_sr, 8.0)
     except Exception:
         scale=dict(correlation=0.0, scale=active_scale, offset_sec=group[0][0], matched_duration_sec=emu_span)
+    ref_at_emu=run_ffmpeg_audio(source, emu_sr) if emu_sr != expected_sr else ref
+    anchors=anchor_time_scale(ref_at_emu, emu, emu_sr, 8.0)
+    anchored=min(a['correlation'] for a in anchors['anchors']) >= 0.5
+    if anchored:
+        # Primary result: the anchors resolve 10 ms over ~20 s (0.05 %).
+        active_scale=anchors['time_scale']
+        duration_error_pct=(active_scale - 1.0)*100.0
+        effective_rate=expected_sr/active_scale if active_scale else 0.0
 
     return dict(reference_duration_sec=ref_dur,
+                pitch_method='anchors' if anchored else 'active_span',
+                anchor_check=anchors,
+                active_span_error_pct=(emu_span/ref_span-1.0)*100.0 if ref_span>0 else 0.0,
                 reference_active_span_sec=ref_span,
                 emulator_active_span_sec=emu_span,
                 emulator_match_offset_sec=group[0][0],
@@ -176,11 +227,14 @@ def av_report(stats:List[Tuple[str,Dict]], fps:float, sr:int) -> Dict:
     max_abs=0.0
     for name,st in stats:
         vf=float(st.get('g_video_frames_presented',0))
-        ap=float(st.get('g_mp2psg10_read_pos',0))
+        # g_audio_clock_samples is the player's codec-independent audio clock;
+        # older MP2 builds only expose the PSG read pointer.
+        ap=float(st.get('g_audio_clock_samples',st.get('g_mp2psg10_read_pos',0)))
         delta=ap/sr - vf/fps if fps>0 else 0.0
         max_abs=max(max_abs, abs(delta))
         checkpoints.append(dict(name=name, video_frames=int(vf), audio_samples=int(ap), av_delta_sec=delta,
                                 psg_underflows=int(st.get('g_mp2psg10_underflows',0)),
+                                adpcm_underruns=int(st.get('g_adpcm_underruns',0)),
                                 video_underflows=int(st.get('g_scsi_dma_video_underflows',0)),
                                 video_skipped=int(st.get('g_video_frames_skipped',0)),
                                 done=int(st.get('g_done',0))))
@@ -207,6 +261,7 @@ def startup_report(stats:List[Tuple[str,Dict]]) -> Dict:
         mp2_preroll_ring_at_exit=int(st.get('g_mp2_preroll_ring_at_exit',0)),
         mp2_preroll_guard_count=int(st.get('g_mp2_preroll_guard_count',0)),
         mp2_started=int(st.get('mp2_async',{}).get('started',0)),
+        codec=int(st.get('g_audio_codec',2)),
     )
 
 def read_rgb(path:pathlib.Path) -> np.ndarray:
@@ -243,10 +298,15 @@ def visual_report(frames_dir:pathlib.Path, source:pathlib.Path, stats:List[Tuple
         # display, so visual content checks are only meaningful before natural end.
         if int(st.get('g_done',0)):
             continue
-        src_idx=max(0, min(frame_count-1, vf-1))
-        ref_path=source_frame_png(source, src_idx, fps, cache)
+        # A frame latched in field N is scanned out from field N+1, so the
+        # screenshot shows the last presented frame or the one before it.
         em=read_rgb(img)
-        rf=read_rgb(ref_path)
+        cands=[]
+        for idx in sorted({max(0, min(frame_count-1, vf-1)), max(0, min(frame_count-1, vf-2))}):
+            ref=read_rgb(source_frame_png(source, idx, fps, cache))
+            c=float(np.corrcoef(em.ravel(), ref.ravel())[0,1]) if ref.shape==em.shape and np.std(em)>1e-6 and np.std(ref)>1e-6 else -1.0
+            cands.append((c, idx, ref))
+        _, src_idx, rf=max(cands, key=lambda t: t[0])
         if em.shape != rf.shape:
             failures.append(f'{img.name}: shape {em.shape} != source {rf.shape}')
             continue
@@ -288,7 +348,7 @@ def visual_report(frames_dir:pathlib.Path, source:pathlib.Path, stats:List[Tuple
     return dict(pass_=not failures, failures=failures, checks=checks)
 
 def main():
-    ap=argparse.ArgumentParser(description='Regression checks for PC-FX RAINBOW+MP2 validation artifacts.')
+    ap=argparse.ArgumentParser(description='Regression checks for PC-FX RAINBOW+MP2/ADPCM validation artifacts.')
     ap.add_argument('--stream', required=True, type=pathlib.Path)
     ap.add_argument('--source', required=True, type=pathlib.Path)
     ap.add_argument('--wav', type=pathlib.Path)
@@ -317,6 +377,7 @@ def main():
     if av['max_abs_av_delta_sec'] > args.max_av_drift_sec: failures.append(f'max_abs_av_delta_sec {av["max_abs_av_delta_sec"]:.3f} > {args.max_av_drift_sec:.3f}')
     for cp in av['checkpoints']:
         if cp['psg_underflows']: failures.append(f'{cp["name"]}: PSG underflows {cp["psg_underflows"]}')
+        if cp['adpcm_underruns']: failures.append(f'{cp["name"]}: ADPCM underruns {cp["adpcm_underruns"]}')
         if cp['video_underflows']: failures.append(f'{cp["name"]}: video underflows {cp["video_underflows"]}')
     if startup.get('audio_start_latch_frame',0) == 0:
         failures.append('audio never started according to startup counters')
@@ -324,7 +385,8 @@ def main():
         failures.append(f'audio starts after {startup.get("audio_start_visible_fields")} visible fields > {args.max_audio_start_visible_fields}')
     if startup.get('audio_start_ring_used',0) < args.min_start_ring_samples:
         failures.append(f'audio start ring {startup.get("audio_start_ring_used",0)} < {args.min_start_ring_samples} samples')
-    if startup.get('mp2_preroll_ring_at_exit',0) < args.min_start_ring_samples:
+    # MP2 decodes a hidden prefill; ADPCM starts from its loaded KRAM ring.
+    if startup.get('codec') == 2 and startup.get('mp2_preroll_ring_at_exit',0) < args.min_start_ring_samples:
         failures.append(f'MP2 hidden preroll ring {startup.get("mp2_preroll_ring_at_exit",0)} < {args.min_start_ring_samples} samples')
     if wav_cmp and abs(wav_cmp['duration_error_pct']) > args.max_pitch_error_pct:
         failures.append(f'pitch/duration error {wav_cmp["duration_error_pct"]:.3f}% > {args.max_pitch_error_pct:.3f}%')

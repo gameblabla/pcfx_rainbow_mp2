@@ -7,3 +7,5 @@ src/*.o
 *.zip
 *.pcfv
 *.mp2
+validation/
+__pycache__/

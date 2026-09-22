@@ -12,8 +12,11 @@
 void scsi_reset(void);
 void eris_scsi_abort(void);
 #include "pcfx_pcfv_player.h"
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-#include "pcfx_mp2_async.h"
+#include "pcfx_pcfv_internal.h"
+#if defined(PCFX_PCFV_AUDIO_MP2)
+#include "pcfv_mp2_stream.h"
+#elif defined(PCFX_PCFV_AUDIO_ADPCM)
+#include "pcfv_adpcm_stream.h"
 #endif
 
 #if defined(HAVE_GENERATED_LBAS)
@@ -31,7 +34,6 @@ void eris_scsi_abort(void);
 #define PCFV_MAX_FRAMES        4096u
 #define PCFV_HEADER_READ_BYTES (((64u + (PCFV_MAX_FRAMES * 32u)) + 2047u) & ~2047u)
 #define PCFV_MAX_AUDIO_CHUNKS  1024u
-#define PCFV_SECTOR_SIZE       2048u
 #define RAINBOW_WIDTH           256u
 #define RAINBOW_HEIGHT          240u
 #define RAINBOW_START_SCANLINE  6u
@@ -45,39 +47,14 @@ void eris_scsi_abort(void);
 #define VIDEO_BUFFER_STRIDE_MAX 0x00001000u /* 8 KiB byte spacing; max four 2048-byte sectors */
 #define VIDEO_BUFFER_STRIDE_DEFAULT 0x00001000u
 #define VIDEO_BATCH_MAX          8u
-#define KRAM_ADPCM_WORD_ADDR    0x00020000u
-#define KRAM_MP2_WORD_ADDR      0x0001D000u
-#define MP2_CHUNK_TMP_BYTES     (PCFX_MP2_STREAM_CHUNK_MAX_SECTORS * PCFV_SECTOR_SIZE)
-/* Header/index is read before video buffering starts, so it may reuse the
-   low KRAM area that later becomes the RAINBOW read-ahead ring. */
+/* KRAM page 0 (word addresses): 0x01000-0x1CFFF RAINBOW read-ahead ring;
+   0x1D000-0x1EFFF MP2 bounce window (MP2 builds); 0x20000-0x2FFFF ADPCM ring
+   (ADPCM builds).  The header/index is read before video buffering starts,
+   so it may reuse the low area that later becomes the RAINBOW ring. */
 #define KRAM_HEADER_WORD_ADDR   0x00001000u
-#define ADPCM_HALF_BYTES        65536u
-#define ADPCM_RING_BYTES        (ADPCM_HALF_BYTES * 2u)
-#define ADPCM_HALF_WORDS        (ADPCM_HALF_BYTES / 2u)
-#define ADPCM_RING_WORDS        (ADPCM_RING_BYTES / 2u)
 #define SCSI_TIMEOUT_TICKS      0x00300000u
 #define SCHEDULER_POLL_BUDGET   96u
 #define AUDIO_START_AFTER_VISIBLE_FIELDS 1u
-
-#define PCFX_KING_ADPCM_CH0_ENABLE 0x0001u
-#define PCFV_FLAG_MP2_AUDIO 0x0002u
-#define PCFV_AUDIO_CODEC_NONE  0u
-#define PCFV_AUDIO_CODEC_ADPCM 1u
-#define PCFV_AUDIO_CODEC_MP2   2u
-
-static uint16_t pcfx_adpcm_rate_bits(uint32_t rate_hz) {
-    if (rate_hz >= 24000u) return 0u; /* PC-FX ~31.47kHz */
-    if (rate_hz >= 12000u) return 1u; /* PC-FX ~15.73kHz */
-    if (rate_hz >= 6000u)  return 2u;
-    return 3u;
-}
-
-static int pcfx_adpcm_rate_enum(uint32_t rate_hz) {
-    if (rate_hz >= 24000u) return ADPCM_RATE_32000;
-    if (rate_hz >= 12000u) return ADPCM_RATE_16000;
-    if (rate_hz >= 6000u)  return ADPCM_RATE_8000;
-    return ADPCM_RATE_4000;
-}
 
 static uint8_t g_pcfv_head[PCFV_HEADER_READ_BYTES] __attribute__((aligned(4)));
 
@@ -92,31 +69,25 @@ typedef struct {
     uint32_t flags;
 } FrameEntry;
 
-typedef struct {
-    uint32_t sector;
-    uint32_t sectors;
-    uint32_t byte_offset;
-    uint16_t frame_index;
-} AudioChunk;
-
 static int cd_dma_is_busy(void);
 static uint16_t count_ready_video_buffers(void);
-static void kram_read_bytes(uint32_t word_addr, uint8_t *dst, uint32_t bytes);
 static FrameEntry g_entries[PCFV_MAX_FRAMES];
-static AudioChunk g_audio_chunks[PCFV_MAX_AUDIO_CHUNKS];
+static PcfvAudioChunk g_audio_chunks[PCFV_MAX_AUDIO_CHUNKS];
 static uint16_t g_frame_count;
 static uint16_t g_fps_num;
 static uint16_t g_fps_den;
 static uint16_t g_audio_chunk_count;
-static uint16_t g_next_audio_chunk;
 static uint32_t g_data_start_sector;
 static uint32_t g_audio_preroll_sectors;
 static uint32_t g_audio_refill_sectors;
 static uint32_t g_ring_half_bytes;
 static uint32_t g_audio_bytes;
 static uint32_t g_audio_rate_hz;
+static uint32_t g_audio_sectors;
 static uint16_t g_pcfv_flags;
 static uint8_t g_audio_codec;
+static uint8_t g_audio_active;        /* the compiled backend plays this stream */
+static uint32_t g_audio_clock_samples; /* last audio clock, for validation */
 
 static inline void port_out_h(uint32_t port, uint16_t value) {
     __asm__ volatile ("out.h %0,0[%1]" :: "r"(value), "r"(port) : "memory");
@@ -149,11 +120,6 @@ static void king_write_reg16(uint16_t reg, uint16_t value) {
 static void king_write_reg32(uint16_t reg, uint32_t value) {
     king_select(reg);
     port_out_w(0x604, value);
-}
-
-static uint16_t king_read_reg16(uint16_t reg) {
-    king_select(reg);
-    return port_in_h(0x604);
 }
 
 static uint16_t rd16(const uint8_t *p) {
@@ -235,11 +201,8 @@ typedef enum {
 typedef enum {
     CD_REQ_NONE = 0,
     CD_REQ_HEADER,
-    CD_REQ_AUDIO_PREROLL,
-    CD_REQ_AUDIO_HALF0,
-    CD_REQ_AUDIO_HALF1,
     CD_REQ_VIDEO,
-    CD_REQ_MP2
+    CD_REQ_AUDIO
 } CdReqKind;
 
 typedef struct {
@@ -261,11 +224,7 @@ typedef struct {
 
 static CdDmaRequest g_cd_dma;
 static uint8_t g_header_ready;
-static uint8_t g_audio_preroll_ready;
-static uint8_t g_adpcm_started;
 static uint8_t g_rainbow_visible;
-static uint8_t g_pending_audio_half0;
-static uint8_t g_pending_audio_half1;
 static uint32_t g_scsi_dma_started;
 static uint32_t g_scsi_dma_completed;
 static uint32_t g_scsi_dma_errors;
@@ -279,13 +238,10 @@ static uint32_t g_video_ready_highwater;
 static uint32_t g_vblank_latched_frames;
 static uint32_t g_midfield_latched_frames;
 static uint32_t g_video_buffer_stride_words;
-static uint32_t g_audio_refills_completed;
 static uint32_t g_audio_start_latch_frame;
 static uint32_t g_audio_start_visible_fields;
 static uint32_t g_audio_start_ring_used;
 static uint32_t g_audio_start_samples_emitted;
-static uint32_t g_mp2_preroll_ring_at_exit;
-static uint32_t g_mp2_preroll_guard_count;
 static uint32_t g_stream_lba;
 static uint16_t g_stop_buttons;
 static uint16_t g_pause_buttons;
@@ -297,124 +253,52 @@ static uint8_t g_seek_mode;
 static uint8_t g_seek_in_progress;
 static uint16_t g_start_frame;
 static uint32_t g_seek_sector;
-static uint32_t g_audio_preroll_src_sector;
-static uint32_t g_audio_preroll_run_sectors;
-static uint16_t g_adpcm_control_word;
 static uint32_t g_prev_pad;
 static uint16_t g_fields_per_frame;
 static uint16_t g_field_counter;
 static uint32_t g_rainbow_visible_fields;
-static uint32_t g_mp2_sync_pauses;
-static uint32_t g_mp2_sync_resumes;
 
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-static PcfxMp2Async g_mp2_async;
-static uint8_t g_mp2_chunk_tmp[MP2_CHUNK_TMP_BYTES] __attribute__((aligned(4)));
-static uint32_t g_mp2_pending_byte_offset;
-static uint32_t g_mp2_pending_sectors;
-static uint8_t g_mp2_loaded;
-static uint8_t g_mp2_enabled;
-static uint32_t g_mp2_size_bytes;
-static uint8_t g_mp2_decode_budget_used;
-#define PCFV_MP2_PREFILL_FRAMES 24u
-#define PCFV_MP2_FIELD_BUDGET   1u
-#define PCFV_MP2_PREFETCH_LOW_BYTES (24u * 1024u)
-#define PCFV_MP2_START_RING_SAMPLES (24u * 1152u)
-#define PCFV_MP2_DECODE_LOW_SAMPLES (16u * 1152u)
-#define PCFV_MP2_DECODE_HIGH_SAMPLES (24u * 1152u)
-#define PCFV_MP2_URGENT_RING_SAMPLES (8u * 1152u)
-#define PCFV_MP2_CRITICAL_RING_SAMPLES (4u * 1152u)
-#define PCFV_MP2_URGENT_BYTES 8192u
-#define PCFV_MP2_SYNC_LEAD_FRAMES 4u
-#define PCFV_MP2_SYNC_RESUME_FRAMES 2u
-static int pcfv_mp2_fetch_next_chunk(void);
-static void pcfv_mp2_decode_budget(uint32_t frames) {
-    uint32_t used;
-    if (!g_mp2_enabled) return;
-    if (g_mp2_decode_budget_used) return;
-    g_mp2_decode_budget_used = 1u;
-    used = pcfx_mp2_async_ring_used();
-    if (!pcfx_mp2_async_started(&g_mp2_async)) {
-        if (used < PCFV_MP2_START_RING_SAMPLES)
-            (void)pcfx_mp2_async_update(&g_mp2_async, frames);
-        return;
-    }
-    if (used < PCFV_MP2_DECODE_LOW_SAMPLES) {
-        (void)pcfx_mp2_async_update(&g_mp2_async, frames);
-    }
-}
-
-static int pcfv_mp2_should_fetch_urgent(void) {
-    if (g_audio_codec != PCFV_AUDIO_CODEC_MP2 || !g_mp2_enabled) return 0;
-    if (g_next_audio_chunk >= g_audio_chunk_count) return 0;
-    if (!pcfx_mp2_async_started(&g_mp2_async)) {
-        uint16_t target = VIDEO_PREBUFFER_TARGET;
-        if (target > VIDEO_BUFFER_COUNT - 2u) target = VIDEO_BUFFER_COUNT - 2u;
-        if (!g_video_frames_presented && count_ready_video_buffers() < target) return 0;
-        return pcfx_mp2_async_ring_used() < PCFV_MP2_START_RING_SAMPLES;
-    }
-    if (pcfx_mp2_async_ring_used() < PCFV_MP2_CRITICAL_RING_SAMPLES) return 1;
-    if (pcfx_mp2_async_ring_used() < PCFV_MP2_URGENT_RING_SAMPLES &&
-        pcfx_mp2_stream_buffered_bytes(&g_mp2_async) < PCFV_MP2_URGENT_BYTES) return 1;
-    return 0;
-}
-static void pcfv_mp2_prepare_loaded(void) {
-    if (g_audio_codec == PCFV_AUDIO_CODEC_MP2) {
-        if (!g_mp2_enabled && g_audio_bytes) {
-            if (pcfx_mp2_stream_begin(&g_mp2_async, g_audio_bytes)) g_mp2_enabled = 1u;
-        }
-        return;
-    }
-    if (!g_mp2_loaded || g_mp2_enabled || !g_mp2_size_bytes) return;
-    if (pcfx_mp2_async_open(&g_mp2_async, g_pcfx_mp2_preload_buf, g_mp2_size_bytes)) {
-        g_mp2_enabled = 1u;
-        (void)pcfx_mp2_async_update(&g_mp2_async, PCFV_MP2_PREFILL_FRAMES);
-    } else {
-        g_mp2_loaded = 0u;
-        g_mp2_enabled = 0u;
-    }
-}
-static uint32_t pcfv_mp2_sync_limit_samples(uint32_t lead_frames) {
-    uint64_t n;
-    uint32_t frames;
-    if (!g_fps_num || !g_audio_rate_hz) return 0xffffffffu;
-    frames = g_video_frames_presented + lead_frames;
-    n = (uint64_t)frames * (uint64_t)g_audio_rate_hz * (uint64_t)g_fps_den;
-    n /= (uint64_t)g_fps_num;
-    if (n > 0xffffffffull) return 0xffffffffu;
-    return (uint32_t)n;
-}
-
-static int pcfv_mp2_audio_within_video_window(uint32_t lead_frames) {
-    if (!g_video_frames_presented) return 0;
-    return pcfx_mp2_async_samples_emitted() < pcfv_mp2_sync_limit_samples(lead_frames);
-}
-
-static void pcfv_mp2_sync_to_video(void) {
-    /* Do not stop the PSG timer for A/V sync: timer stop/resume creates audible
-       discontinuities even when the ring never underflows.  Keep audio
-       continuous; video presentation is buffered and may skip a stale frame if
-       it ever falls behind.  Retain this counter as a diagnostic lead meter. */
-    if (!g_mp2_enabled || !pcfx_mp2_async_started(&g_mp2_async)) return;
-    if (pcfx_mp2_async_playing() && !pcfv_mp2_audio_within_video_window(PCFV_MP2_SYNC_LEAD_FRAMES)) {
-        g_mp2_sync_pauses++;
-    }
-}
-
-static void pcfv_mp2_start_if_ready(void) {
-    uint32_t threshold = pcfx_mp2_async_started(&g_mp2_async) ?
-        PCFV_MP2_URGENT_RING_SAMPLES : PCFV_MP2_START_RING_SAMPLES;
-    if (!g_mp2_enabled) return;
-    if (pcfx_mp2_async_ring_used() >= threshold) {
-        uint8_t was_playing = (uint8_t)pcfx_mp2_async_playing();
-        pcfx_mp2_async_start(&g_mp2_async);
-        if (!was_playing && pcfx_mp2_async_playing()) g_mp2_sync_resumes++;
-    }
-}
+/* Audio backend hooks.  With no backend compiled (or a stream whose audio the
+   backend cannot play) every hook is a no-op and video is paced by fields. */
+#if defined(PCFX_PCFV_HAVE_AUDIO)
+#define AUDIO_ON (g_audio_active)
+static inline void audio_new_field(void) { if (AUDIO_ON) pcfv_audio_new_field(); }
+static inline void audio_service(void) { if (AUDIO_ON) pcfv_audio_service(); }
+static inline int audio_fetch_urgent(void) { return AUDIO_ON ? pcfv_audio_fetch_urgent() : 0; }
+static inline int audio_fetch_background(void) { return AUDIO_ON ? pcfv_audio_fetch_background() : 0; }
+static inline void audio_cd_done(void) { if (AUDIO_ON) pcfv_audio_cd_done(); }
+static inline void audio_cd_failed(void) { if (AUDIO_ON) pcfv_audio_cd_failed(); }
+static inline int audio_preroll_ready(void) { return AUDIO_ON ? pcfv_audio_preroll_ready() : 1; }
+static inline void audio_seek(uint16_t frame) { if (AUDIO_ON) pcfv_audio_seek(frame); }
+static inline void audio_after_boot(void) { if (AUDIO_ON) pcfv_audio_after_boot(); }
+static inline void audio_visible_field(void) { if (AUDIO_ON) pcfv_audio_visible_field(); }
+static inline int audio_playing(void) { return AUDIO_ON ? pcfv_audio_playing() : 0; }
+static inline int audio_is_clock(void) { return AUDIO_ON && pcfv_audio_is_clock(); }
+static inline int audio_clock_running(void) { return audio_is_clock() && pcfv_audio_started(); }
+static inline uint32_t audio_clock(void) { return AUDIO_ON ? pcfv_audio_clock() : 0u; }
+static inline uint32_t audio_buffered(void) { return AUDIO_ON ? pcfv_audio_buffered() : 0u; }
+static inline int audio_complete(void) { return AUDIO_ON ? pcfv_audio_complete() : 1; }
+static inline void audio_set_paused(int paused) { if (AUDIO_ON) pcfv_audio_set_paused(paused); }
+static inline void audio_stop(void) { if (AUDIO_ON) pcfv_audio_stop(); }
 #else
-#define pcfv_mp2_decode_budget(frames) ((void)0)
-#define pcfv_mp2_start_if_ready() ((void)0)
-#define pcfv_mp2_sync_to_video() ((void)0)
+static inline void audio_new_field(void) { }
+static inline void audio_service(void) { }
+static inline int audio_fetch_urgent(void) { return 0; }
+static inline int audio_fetch_background(void) { return 0; }
+static inline void audio_cd_done(void) { }
+static inline void audio_cd_failed(void) { }
+static inline int audio_preroll_ready(void) { return 1; }
+static inline void audio_seek(uint16_t frame) { (void)frame; }
+static inline void audio_after_boot(void) { }
+static inline void audio_visible_field(void) { }
+static inline int audio_playing(void) { return 0; }
+static inline int audio_is_clock(void) { return 0; }
+static inline int audio_clock_running(void) { return 0; }
+static inline uint32_t audio_clock(void) { return 0u; }
+static inline uint32_t audio_buffered(void) { return 0u; }
+static inline int audio_complete(void) { return 1; }
+static inline void audio_set_paused(int paused) { (void)paused; }
+static inline void audio_stop(void) { }
 #endif
 
 static uint8_t g_video_state[VIDEO_BUFFER_COUNT]; /* 0 free, 1 loading, 2 ready, 3 displaying */
@@ -508,37 +392,26 @@ static int cd_dma_is_busy(void) {
 }
 
 static void cd_dma_complete_current(void) {
-    if (g_cd_dma.kind == CD_REQ_HEADER) {
+    CdReqKind kind = g_cd_dma.kind;
+    if (kind == CD_REQ_HEADER) {
         g_header_ready = 1;
-    } else if (g_cd_dma.kind == CD_REQ_AUDIO_PREROLL) {
-        g_audio_preroll_ready = 1;
-    } else if (g_cd_dma.kind == CD_REQ_AUDIO_HALF0 || g_cd_dma.kind == CD_REQ_AUDIO_HALF1) {
-        g_audio_refills_completed++;
-    } else if (g_cd_dma.kind == CD_REQ_VIDEO && g_cd_dma.video_buf < VIDEO_BUFFER_COUNT) {
+    } else if (kind == CD_REQ_VIDEO && g_cd_dma.video_buf < VIDEO_BUFFER_COUNT) {
         uint16_t n = g_cd_dma.video_count ? g_cd_dma.video_count : 1u;
         uint16_t k;
         for (k = 0; k < n && (uint16_t)(g_cd_dma.video_buf + k) < VIDEO_BUFFER_COUNT; ++k) {
             g_video_state[g_cd_dma.video_buf + k] = 2;
             g_video_ready_delay[g_cd_dma.video_buf + k] = 2;
         }
-    } else if (g_cd_dma.kind == CD_REQ_MP2) {
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-        uint32_t bytes = g_mp2_pending_sectors * PCFV_SECTOR_SIZE;
-        if (g_mp2_pending_byte_offset + bytes > g_audio_bytes) bytes = g_audio_bytes - g_mp2_pending_byte_offset;
-        kram_read_bytes(KRAM_MP2_WORD_ADDR, g_mp2_chunk_tmp, g_mp2_pending_sectors * PCFV_SECTOR_SIZE);
-        (void)pcfx_mp2_stream_append_bytes(&g_mp2_async, g_mp2_pending_byte_offset, g_mp2_chunk_tmp, bytes);
-        if (g_next_audio_chunk < g_audio_chunk_count) g_next_audio_chunk++;
-        g_mp2_pending_byte_offset = 0;
-        g_mp2_pending_sectors = 0;
-#endif
     }
     g_cd_dma.kind = CD_REQ_NONE;
     g_cd_dma.state = CD_DMA_DONE;
     g_scsi_dma_completed++;
+    if (kind == CD_REQ_AUDIO) audio_cd_done();
 }
 
 static void cd_dma_fail_current(void) {
-    if (g_cd_dma.kind == CD_REQ_VIDEO && g_cd_dma.video_buf < VIDEO_BUFFER_COUNT) {
+    CdReqKind kind = g_cd_dma.kind;
+    if (kind == CD_REQ_VIDEO && g_cd_dma.video_buf < VIDEO_BUFFER_COUNT) {
         uint16_t n = g_cd_dma.video_count ? g_cd_dma.video_count : 1u;
         uint16_t k;
         for (k = 0; k < n && (uint16_t)(g_cd_dma.video_buf + k) < VIDEO_BUFFER_COUNT; ++k) {
@@ -546,18 +419,12 @@ static void cd_dma_fail_current(void) {
             g_video_ready_delay[g_cd_dma.video_buf + k] = 0;
             g_video_frame[g_cd_dma.video_buf + k] = 0xffffu;
         }
-    } else if (g_cd_dma.kind == CD_REQ_MP2) {
-        g_mp2_pending_byte_offset = 0;
-        g_mp2_pending_sectors = 0;
-    } else if (g_cd_dma.kind == CD_REQ_AUDIO_HALF0) {
-        g_pending_audio_half0 = 1;
-    } else if (g_cd_dma.kind == CD_REQ_AUDIO_HALF1) {
-        g_pending_audio_half1 = 1;
     }
     g_cd_dma.kind = CD_REQ_NONE;
     g_cd_dma.state = CD_DMA_ERROR;
     g_scsi_dma_errors++;
     scsi_bus_abort_reset();
+    if (kind == CD_REQ_AUDIO) audio_cd_failed();
 }
 
 static int cd_dma_start(CdReqKind kind, uint32_t lba, uint32_t kram_word_addr, uint32_t bytes, uint16_t video_buf) {
@@ -579,6 +446,24 @@ static int cd_dma_start(CdReqKind kind, uint32_t lba, uint32_t kram_word_addr, u
     g_scsi_dma_started++;
     return 1;
 }
+
+/* ---- Services for the audio backend (pcfx_pcfv_internal.h) ---- */
+
+int pcfv_cd_busy(void) { return cd_dma_is_busy(); }
+
+int pcfv_cd_read_audio(uint32_t lba, uint32_t kram_word_addr, uint32_t sectors) {
+    return cd_dma_start(CD_REQ_AUDIO, lba, kram_word_addr, sectors * PCFV_SECTOR_SIZE, 0xffffu);
+}
+
+uint16_t pcfv_video_ready_count(void) { return count_ready_video_buffers(); }
+
+uint16_t pcfv_video_prebuffer_target(void) {
+    uint16_t target = VIDEO_PREBUFFER_TARGET;
+    if (target > VIDEO_BUFFER_COUNT - 2u) target = VIDEO_BUFFER_COUNT - 2u;
+    return target;
+}
+
+uint32_t pcfv_video_frames_presented(void) { return g_video_frames_presented; }
 
 static void cd_dma_poll_one(void) {
     ScsiPhase ph;
@@ -807,32 +692,59 @@ static void set_rainbow_visible(uint8_t visible) {
     g_rainbow_visible = visible ? 1 : 0;
 }
 
+/* Interrupt-atomic KING register runs.  Not libpcfx's irq_disable()/
+   irq_restore(): irq_disable() returns the raw PSW.ID bit (0x1000) and writes
+   PSW = 0x1000, while irq_restore() keeps only bit 0 of its argument, so
+   irq_restore(irq_disable()) always leaves interrupts ENABLED
+   (vendor/libpcfx/src/v810.S).  Here that switched IRQs on at the first
+   RAINBOW latch of builds that install no handler (ADPCM, silent), and a
+   stray interrupt overwrote the stream index in RAM; MP2 builds only worked
+   because it also serviced a pending VDC-A IRQ early (see psg_sample.c). */
+static inline uint32_t psw_irq_save(void) {
+    uint32_t psw, off;
+    __asm__ volatile ("stsr PSW, %0" : "=r"(psw) :: "memory");
+    off = psw | 0x1000u;
+    __asm__ volatile ("ldsr %0, PSW" :: "r"(off) : "memory");
+    return psw & 0x1000u;
+}
+
+static inline void psw_irq_restore(uint32_t id) {
+    uint32_t psw;
+    __asm__ volatile ("stsr PSW, %0" : "=r"(psw) :: "memory");
+    psw = (psw & ~0x1000u) | id;
+    __asm__ volatile ("ldsr %0, PSW" :: "r"(psw) : "memory");
+}
+
 static void start_rainbow_frame(uint32_t kram_word_addr, uint16_t block_count) {
-    int irq_state = irq_disable();
+    uint32_t irq_state = psw_irq_save();
     king_write_reg16(0x40, 0x0000);
     king_write_reg32(0x41, kram_word_addr);
     king_write_reg16(0x42, RAINBOW_START_SCANLINE);
     king_write_reg16(0x43, block_count);
     king_write_reg16(0x44, 0x0000);
     king_write_reg16(0x40, 0x0001);
-    irq_restore(irq_state);
+    psw_irq_restore(irq_state);
 }
 
-static void kram_read_bytes(uint32_t word_addr, uint8_t *dst, uint32_t bytes) {
-    uint32_t words = (bytes + 1u) >> 1;
-    uint32_t i;
-    king_write_reg32(0x0C, (word_addr & 0x0003FFFFu) | (1u << 18));
+/* KRAM -> RAM with libpcfx's auto-incrementing read cursor, the same
+   copy-out eris_cd_read_dma() uses.  Little-endian: byte 0 is the low half. */
+void pcfv_kram_read(uint32_t word_addr, uint8_t *dst, uint32_t bytes) {
+    uint32_t i, words = bytes >> 1;
+    king_set_kram_read(word_addr, 1);
     for (i = 0; i < words; ++i) {
-        uint16_t v = king_read_reg16(0x0E);
+        uint16_t v = king_kram_read();
         dst[i * 2u + 0u] = (uint8_t)v;
-        if ((i * 2u + 1u) < bytes) dst[i * 2u + 1u] = (uint8_t)(v >> 8);
+        dst[i * 2u + 1u] = (uint8_t)(v >> 8);
     }
+    if (bytes & 1u) dst[bytes - 1u] = (uint8_t)king_kram_read();
 }
 
 static int parse_pcfv_header(void) {
-    uint32_t index_bytes;
-    kram_read_bytes(KRAM_HEADER_WORD_ADDR, g_pcfv_head, PCFV_HEADER_READ_BYTES);
+    uint32_t index_bytes, stride_sectors;
+    uint16_t i;
 
+    /* The CD read covers the largest index; copy out only what this one has. */
+    pcfv_kram_read(KRAM_HEADER_WORD_ADDR, g_pcfv_head, 64u);
     if (memcmp(g_pcfv_head, "PCFV0001", 8) != 0) return 0;
     if (rd16(g_pcfv_head + 8) != RAINBOW_WIDTH || rd16(g_pcfv_head + 10) != RAINBOW_HEIGHT) return 0;
 
@@ -845,7 +757,9 @@ static int parse_pcfv_header(void) {
 
     index_bytes = rd32(g_pcfv_head + 20);
     g_data_start_sector = rd32(g_pcfv_head + 24);
+    stride_sectors = rd32(g_pcfv_head + 28);
     g_audio_bytes = rd32(g_pcfv_head + 32);
+    g_audio_sectors = rd32(g_pcfv_head + 36);
     g_audio_preroll_sectors = rd32(g_pcfv_head + 40);
     g_audio_refill_sectors = rd32(g_pcfv_head + 44);
     g_ring_half_bytes = rd32(g_pcfv_head + 48);
@@ -858,44 +772,63 @@ static int parse_pcfv_header(void) {
     } else {
         g_audio_codec = PCFV_AUDIO_CODEC_NONE;
     }
-    if (g_audio_codec == PCFV_AUDIO_CODEC_ADPCM && g_ring_half_bytes != ADPCM_HALF_BYTES) return 0;
-    g_video_buffer_stride_words = (rd32(g_pcfv_head + 28) * PCFV_SECTOR_SIZE + 1u) >> 1;
+    g_video_buffer_stride_words = (stride_sectors * PCFV_SECTOR_SIZE + 1u) >> 1;
     if (!g_video_buffer_stride_words || g_video_buffer_stride_words > VIDEO_BUFFER_STRIDE_MAX) return 0;
     if (index_bytes != (uint32_t)g_frame_count * 32u) return 0;
     if ((64u + index_bytes) > PCFV_HEADER_READ_BYTES) return 0;
+    pcfv_kram_read(KRAM_HEADER_WORD_ADDR, g_pcfv_head, 64u + index_bytes);
 
     g_audio_chunk_count = 0;
-    {
-        uint16_t i;
-        for (i = 0; i < g_frame_count; ++i) {
-            const uint8_t *e = g_pcfv_head + 64u + ((uint32_t)i * 32u);
-            g_entries[i].video_sector = rd32(e + 0);
-            g_entries[i].video_size = rd32(e + 4);
-            g_entries[i].video_sectors = rd32(e + 8);
-            g_entries[i].video_crc32 = rd32(e + 12);
-            g_entries[i].audio_sector = rd32(e + 16);
-            g_entries[i].audio_sectors = rd32(e + 20);
-            g_entries[i].audio_byte_offset = rd32(e + 24);
-            g_entries[i].flags = rd32(e + 28);
-            /* A batched DMA must have the same disc and KRAM slot stride. */
-            if (g_entries[i].video_sectors != rd32(g_pcfv_head + 28) ||
-                !g_entries[i].video_size ||
-                g_entries[i].video_size > g_entries[i].video_sectors * PCFV_SECTOR_SIZE ||
-                g_entries[i].video_sector < g_data_start_sector) return 0;
-            if (g_audio_codec == PCFV_AUDIO_CODEC_MP2 &&
-                g_entries[i].audio_sectors > PCFX_MP2_STREAM_CHUNK_MAX_SECTORS) return 0;
-            if (g_entries[i].audio_sectors && g_audio_chunk_count < PCFV_MAX_AUDIO_CHUNKS) {
-                g_audio_chunks[g_audio_chunk_count].sector = g_entries[i].audio_sector;
-                g_audio_chunks[g_audio_chunk_count].sectors = g_entries[i].audio_sectors;
-                g_audio_chunks[g_audio_chunk_count].byte_offset = g_entries[i].audio_byte_offset;
-                g_audio_chunks[g_audio_chunk_count].frame_index = i;
-                g_audio_chunk_count++;
-            }
+    for (i = 0; i < g_frame_count; ++i) {
+        const uint8_t *e = g_pcfv_head + 64u + ((uint32_t)i * 32u);
+        g_entries[i].video_sector = rd32(e + 0);
+        g_entries[i].video_size = rd32(e + 4);
+        g_entries[i].video_sectors = rd32(e + 8);
+        g_entries[i].video_crc32 = rd32(e + 12);
+        g_entries[i].audio_sector = rd32(e + 16);
+        g_entries[i].audio_sectors = rd32(e + 20);
+        g_entries[i].audio_byte_offset = rd32(e + 24);
+        g_entries[i].flags = rd32(e + 28);
+        /* Every frame fits the KRAM slot; only full-slot frames are batched
+           (video_contiguous_batch_count), so shorter ones are legal. */
+        if (!g_entries[i].video_sectors || g_entries[i].video_sectors > stride_sectors ||
+            !g_entries[i].video_size ||
+            g_entries[i].video_size > g_entries[i].video_sectors * PCFV_SECTOR_SIZE ||
+            g_entries[i].video_sector < g_data_start_sector) return 0;
+        if (g_entries[i].audio_sectors && g_audio_chunk_count < PCFV_MAX_AUDIO_CHUNKS) {
+            g_audio_chunks[g_audio_chunk_count].sector = g_entries[i].audio_sector;
+            g_audio_chunks[g_audio_chunk_count].sectors = g_entries[i].audio_sectors;
+            g_audio_chunks[g_audio_chunk_count].byte_offset = g_entries[i].audio_byte_offset;
+            g_audio_chunks[g_audio_chunk_count].frame_index = i;
+            g_audio_chunk_count++;
         }
     }
     return 1;
 }
 
+/* Hand the parsed stream to the compiled audio backend.  A stream it cannot
+   play (another codec, a malformed layout) plays silently. */
+static void pcfv_attach_audio(void) {
+#if defined(PCFX_PCFV_HAVE_AUDIO)
+    PcfvStreamInfo info;
+    info.lba = g_stream_lba;
+    info.data_start_sector = g_data_start_sector;
+    info.audio_bytes = g_audio_bytes;
+    info.audio_sectors = g_audio_sectors;
+    info.audio_rate_hz = g_audio_rate_hz;
+    info.audio_preroll_sectors = g_audio_preroll_sectors;
+    info.audio_refill_sectors = g_audio_refill_sectors;
+    info.ring_half_bytes = g_ring_half_bytes;
+    info.flags = g_pcfv_flags;
+    info.fps_num = g_fps_num;
+    info.fps_den = g_fps_den;
+    info.frame_count = g_frame_count;
+    info.audio_chunk_count = g_audio_chunk_count;
+    info.audio_codec = g_audio_codec;
+    info.audio_chunks = g_audio_chunks;
+    g_audio_active = (uint8_t)(pcfv_audio_attach(&info) ? 1u : 0u);
+#endif
+}
 
 static uint16_t pcfv_find_frame_for_asset_sector(uint32_t asset_sector) {
     uint16_t i;
@@ -932,41 +865,6 @@ static uint16_t pcfv_resolve_start_frame(void) {
     }
 
     return pcfv_find_frame_for_asset_sector(asset_sector);
-}
-
-static void pcfv_prepare_audio_seek(uint16_t start_frame) {
-    uint32_t target_audio_byte;
-    uint16_t ci;
-    uint16_t chosen = 0xffffu;
-
-    g_audio_preroll_src_sector = g_data_start_sector;
-    g_audio_preroll_run_sectors = g_audio_preroll_sectors;
-    g_next_audio_chunk = 0;
-
-    if (!g_audio_bytes || !g_audio_preroll_sectors || start_frame == 0 || !g_frame_count) return;
-
-    /* Approximate the desired ADPCM point from video time.  PCFV v1 stores
-       refill chunk byte offsets but not independent ADPCM predictor states, so
-       arbitrary audio random access can have a short predictor-settling transient.
-       Branch-heavy games should encode branch clips at ADPCM reset boundaries. */
-    target_audio_byte = (uint32_t)(((uint64_t)g_audio_bytes * (uint64_t)start_frame) / (uint64_t)g_frame_count);
-
-    if (target_audio_byte < (g_audio_preroll_sectors * PCFV_SECTOR_SIZE)) {
-        return;
-    }
-
-    for (ci = 0; ci < g_audio_chunk_count; ++ci) {
-        if (g_audio_chunks[ci].byte_offset <= target_audio_byte) chosen = ci;
-        else break;
-    }
-
-    if (chosen != 0xffffu) {
-        uint32_t fill = g_audio_chunks[chosen].sectors;
-        if (fill > (ADPCM_RING_BYTES / PCFV_SECTOR_SIZE)) fill = ADPCM_RING_BYTES / PCFV_SECTOR_SIZE;
-        g_audio_preroll_src_sector = g_audio_chunks[chosen].sector;
-        g_audio_preroll_run_sectors = fill;
-        g_next_audio_chunk = (uint16_t)(chosen + 1u);
-    }
 }
 
 static void setup_video_buffers(void) {
@@ -1020,6 +918,7 @@ static void cd_dma_cancel_for_seek(void) {
             g_video_frame[g_cd_dma.video_buf] = 0xffffu;
         }
         scsi_bus_abort_reset();
+        if (g_cd_dma.kind == CD_REQ_AUDIO) audio_cd_failed();
     }
     memset(&g_cd_dma, 0, sizeof(g_cd_dma));
 }
@@ -1120,7 +1019,8 @@ static int alloc_video_buf_run(uint16_t wanted, uint16_t *count_out) {
 static uint16_t video_contiguous_batch_count(uint16_t frame) {
     uint16_t n = 1u;
     uint32_t fixed = g_entries[frame].video_sectors;
-    if (!fixed || fixed > 4u) return 1u;
+    /* One DMA fills consecutive KRAM slots, so a frame must fill its slot. */
+    if (fixed * PCFV_SECTOR_SIZE != g_video_buffer_stride_words * 2u) return 1u;
     while (n < VIDEO_BATCH_MAX && (uint16_t)(frame + n) < g_frame_count) {
         uint16_t prev = (uint16_t)(frame + n - 1u);
         uint16_t curf = (uint16_t)(frame + n);
@@ -1185,81 +1085,21 @@ static void queue_more_video_if_idle(void) {
     }
 }
 
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-static int pcfv_mp2_fetch_next_chunk(void) {
-    const uint32_t base = g_stream_lba;
-    const AudioChunk *c;
-    if (g_audio_codec != PCFV_AUDIO_CODEC_MP2 || !g_mp2_enabled) return 0;
-    if (cd_dma_is_busy()) return 0;
-    if (g_next_audio_chunk >= g_audio_chunk_count) return 0;
-    c = &g_audio_chunks[g_next_audio_chunk];
-    if (!c->sectors) { g_next_audio_chunk++; return 1; }
-    if (pcfx_mp2_stream_free_bytes(&g_mp2_async) < (c->sectors * PCFV_SECTOR_SIZE)) return 0;
-    g_mp2_pending_byte_offset = c->byte_offset;
-    g_mp2_pending_sectors = c->sectors;
-    if (!cd_dma_start(CD_REQ_MP2, base + c->sector, KRAM_MP2_WORD_ADDR,
-                      c->sectors * PCFV_SECTOR_SIZE, 0xffffu)) {
-        g_mp2_pending_byte_offset = 0;
-        g_mp2_pending_sectors = 0;
-        return 0;
-    }
-    return 1;
-}
-#endif
-
 static void scheduler_start_if_idle(void) {
-    const uint32_t base = g_stream_lba;
     if (cd_dma_is_busy()) return;
 
     if (!g_header_ready) {
-        (void)cd_dma_start(CD_REQ_HEADER, base, KRAM_HEADER_WORD_ADDR, PCFV_HEADER_READ_BYTES, 0xffffu);
+        (void)cd_dma_start(CD_REQ_HEADER, g_stream_lba, KRAM_HEADER_WORD_ADDR, PCFV_HEADER_READ_BYTES, 0xffffu);
         return;
     }
 
-    if (g_audio_codec == PCFV_AUDIO_CODEC_ADPCM && !g_audio_preroll_ready && g_audio_preroll_run_sectors) {
-        (void)cd_dma_start(CD_REQ_AUDIO_PREROLL, base + g_audio_preroll_src_sector, KRAM_ADPCM_WORD_ADDR,
-                           g_audio_preroll_run_sectors * PCFV_SECTOR_SIZE, 0xffffu);
-        return;
-    }
-
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    if (pcfv_mp2_should_fetch_urgent()) {
-        if (pcfv_mp2_fetch_next_chunk()) return;
-    }
-#endif
-
-    /* ADPCM is prioritized over speculative video because the video ring has
-       several frames of elasticity while the ADPCM ring has hard half-buffer
-       deadlines. */
-    if (g_audio_codec == PCFV_AUDIO_CODEC_ADPCM && g_pending_audio_half0 && g_next_audio_chunk < g_audio_chunk_count) {
-        const AudioChunk *c = &g_audio_chunks[g_next_audio_chunk++];
-        if (cd_dma_start(CD_REQ_AUDIO_HALF0, base + c->sector, KRAM_ADPCM_WORD_ADDR,
-                         c->sectors * PCFV_SECTOR_SIZE, 0xffffu)) {
-            g_pending_audio_half0 = 0;
-        }
-        return;
-    }
-
-    if (g_audio_codec == PCFV_AUDIO_CODEC_ADPCM && g_pending_audio_half1 && g_next_audio_chunk < g_audio_chunk_count) {
-        const AudioChunk *c = &g_audio_chunks[g_next_audio_chunk++];
-        if (cd_dma_start(CD_REQ_AUDIO_HALF1, base + c->sector, KRAM_ADPCM_WORD_ADDR + ADPCM_HALF_WORDS,
-                         c->sectors * PCFV_SECTOR_SIZE, 0xffffu)) {
-            g_pending_audio_half1 = 0;
-        }
-        return;
-    }
+    /* Audio with a hard deadline (ADPCM refills, a starving MP2 ring) goes
+       before speculative video: the video ring has several frames of slack. */
+    if (audio_fetch_urgent()) return;
 
     queue_more_video_if_idle();
 
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    if (!cd_dma_is_busy() &&
-        g_audio_codec == PCFV_AUDIO_CODEC_MP2 && g_mp2_enabled &&
-        g_next_audio_chunk < g_audio_chunk_count &&
-        (count_ready_video_buffers() >= 10u || pcfx_mp2_async_ring_used() < PCFV_MP2_URGENT_RING_SAMPLES) &&
-        pcfx_mp2_stream_buffered_bytes(&g_mp2_async) < PCFV_MP2_PREFETCH_LOW_BYTES) {
-        (void)pcfv_mp2_fetch_next_chunk();
-    }
-#endif
+    if (!cd_dma_is_busy()) (void)audio_fetch_background();
 }
 
 static void scheduler_poll(void) {
@@ -1267,128 +1107,74 @@ static void scheduler_poll(void) {
     if (!cd_dma_is_busy()) scheduler_start_if_idle();
 }
 
-static void poll_adpcm_refill(void) {
-    if (g_audio_codec != PCFV_AUDIO_CODEC_ADPCM) return;
-    if (!g_adpcm_started) return;
-    {
-        uint16_t st = king_read_reg16(0x53);
-        if (st & 0x0002u) g_pending_audio_half0 = 1;
-        if (st & 0x0001u) g_pending_audio_half1 = 1;
-    }
-    scheduler_start_if_idle();
-}
-
-static void setup_adpcm_audio(void) {
-    king_set_kram_pages(0, 0, 0, 0);
-    adpcm_set_control(pcfx_adpcm_rate_enum(g_audio_rate_hz), 1, 1, 1, 1);
-    adpcm_set_volume(0, 63, 63);
-    adpcm_set_volume(1, 0, 0);
-    cdda_set_volume(0, 0);
-
-    king_write_reg16(0x50, 0x0000);
-    king_write_reg16(0x51, 0x0001);
-    king_write_reg16(0x52, 0x0000);
-    king_write_reg16(0x58, (uint16_t)(KRAM_ADPCM_WORD_ADDR >> 8));
-    king_write_reg32(0x59, KRAM_ADPCM_WORD_ADDR + ADPCM_RING_WORDS - 1u);
-    king_write_reg16(0x5A, (uint16_t)((KRAM_ADPCM_WORD_ADDR + ADPCM_HALF_WORDS) >> 6));
-
-    adpcm_set_control(pcfx_adpcm_rate_enum(g_audio_rate_hz), 1, 1, 0, 0);
-    (void)king_read_reg16(0x53);
-    g_adpcm_control_word = (uint16_t)(PCFX_KING_ADPCM_CH0_ENABLE | (pcfx_adpcm_rate_bits(g_audio_rate_hz) << 2));
-    king_write_reg16(0x50, g_adpcm_control_word);
-    g_adpcm_started = 1;
-}
-
 static void fail_black_loop(void) {
     setup_rainbow_regs();
     for (;;) wait_vblank();
+}
+
+/* One hidden boot field: service CD and audio, then wait for vblank. */
+static void boot_field(void) {
+    audio_new_field();
+    scheduler_poll();
+    audio_service();
+    wait_vblank();
+    if (g_cd_dma.state == CD_DMA_ERROR) fail_black_loop();
 }
 
 static void pcfv_boot_stream_async(void) {
     uint16_t ready_count;
 
     scheduler_start_if_idle();
-    while (!g_header_ready) {
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-        g_mp2_decode_budget_used = 0u;
-#endif
-        scheduler_poll();
-        pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
-        wait_vblank();
-        if (g_cd_dma.state == CD_DMA_ERROR) fail_black_loop();
-    }
+    while (!g_header_ready) boot_field();
     if (!parse_pcfv_header()) fail_black_loop();
     g_start_frame = pcfv_resolve_start_frame();
-    pcfv_prepare_audio_seek(g_start_frame);
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    if (g_audio_codec == PCFV_AUDIO_CODEC_MP2) {
-        g_audio_preroll_ready = 1;
-        pcfv_mp2_prepare_loaded();
-        /* Do not read MP2 during the hidden RAINBOW boot/prebuffer phase.
-           MP2 chunks use the same SCSI/KING DMA scheduler as video; fetching
-           begins after the first RAINBOW frame is latched so startup cannot
-           deadlock on audio. */
-    } else
-#endif
-    if (!g_audio_bytes || !g_audio_preroll_run_sectors) g_audio_preroll_ready = 1;
+    pcfv_attach_audio();
+    /* Prime the audio for the start frame.  ADPCM loads its ring now (the
+       scheduler puts audio first); MP2 fetching begins once the RAINBOW
+       read-ahead is full, so startup cannot deadlock on audio. */
+    audio_seek(g_start_frame);
     setup_video_buffers();
 
     scheduler_start_if_idle();
-    while (!g_audio_preroll_ready) {
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-        g_mp2_decode_budget_used = 0u;
-#endif
-        scheduler_poll();
-        pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
-        wait_vblank();
-        if (g_cd_dma.state == CD_DMA_ERROR) fail_black_loop();
-    }
-    /* Do not start ADPCM during the hidden video prebuffer.  The audio engine
-       is started at the same late-raster latch that makes RAINBOW visible,
-       so audio cannot lead the black warm-up screen. */
+    while (!audio_preroll_ready()) boot_field();
+    /* Audio is not started during the hidden video prebuffer: it starts at
+       the late-raster latch that makes RAINBOW visible, so it cannot lead
+       the black warm-up screen. */
 
     /* Prebuffer several video frames before first display.  This removes the
        cadence dependency between command latency and visible frame pacing. */
     ready_count = 0;
     {
-        uint16_t target = VIDEO_PREBUFFER_TARGET;
-        if (target > VIDEO_BUFFER_COUNT - 2u) target = VIDEO_BUFFER_COUNT - 2u;
+        uint16_t target = pcfv_video_prebuffer_target();
         if (target > g_frame_count) target = g_frame_count;
         while (ready_count < target) {
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-            g_mp2_decode_budget_used = 0u;
-#endif
+            audio_new_field();
             ready_count = count_ready_video_buffers();
             scheduler_poll();
-            pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
+            audio_service();
             wait_vblank();
             age_ready_video_buffers();
             if (g_cd_dma.state == CD_DMA_ERROR) fail_black_loop();
         }
     }
 
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    if (g_audio_codec == PCFV_AUDIO_CODEC_MP2 && g_mp2_enabled) {
-        /* Hidden audio prefill after the RAINBOW ring is already full.  This
-           prevents the first visible frames from racing ahead while the first
-           MP2 CD chunk is read and decoded, but it cannot starve startup video. */
+#if defined(PCFX_PCFV_HAVE_AUDIO)
+    if (g_audio_active) {
+        /* Hidden audio prefill after the RAINBOW ring is already full (MP2:
+           decode until the start threshold).  It keeps the first visible
+           frames from racing ahead while the first MP2 chunk is read and
+           decoded, but it cannot starve startup video. */
         uint32_t guard = 0;
-        while (pcfx_mp2_async_ring_used() < PCFV_MP2_START_RING_SAMPLES && guard++ < 240u) {
-            /* Boot does not run through pcfx_pcfv_update(), so the live-loop
-               "one MP2 decode attempt per visible field" guard must be reset
-               here.  Without this, hidden preroll decodes only one MP2 frame
-               and the first visible frames can be silent until runtime decode
-               catches up. */
-            g_mp2_decode_budget_used = 0u;
+        while (pcfv_audio_boot_prefill_pending() && guard++ < 240u) {
+            audio_new_field();
             scheduler_poll();
-            pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
+            audio_service();
             scheduler_start_if_idle();
             wait_vblank();
             age_ready_video_buffers();
             if (g_cd_dma.state == CD_DMA_ERROR) fail_black_loop();
         }
-        g_mp2_preroll_ring_at_exit = pcfx_mp2_async_ring_used();
-        g_mp2_preroll_guard_count = guard;
+        pcfv_audio_boot_prefill_done(guard);
     }
 #endif
 
@@ -1402,19 +1188,11 @@ static void pcfv_boot_stream_async(void) {
 static void pcfx_pcfv_reset_state(void) {
     memset(&g_cd_dma, 0, sizeof(g_cd_dma));
     g_header_ready = 0;
-    g_audio_preroll_ready = 0;
-    g_adpcm_started = 0;
-    g_adpcm_control_word = 0;
     g_rainbow_visible = 0;
     g_paused = 0;
-    g_pending_audio_half0 = 0;
-    g_pending_audio_half1 = 0;
-    g_next_audio_chunk = 0;
     g_audio_chunk_count = 0;
-    g_mp2_pending_byte_offset = 0;
-    g_mp2_pending_sectors = 0;
-    g_audio_preroll_src_sector = 0;
-    g_audio_preroll_run_sectors = 0;
+    g_audio_active = 0;
+    g_audio_clock_samples = 0;
     g_frame_count = 0;
     g_start_frame = 0;
     g_seek_in_progress = 0;
@@ -1428,8 +1206,6 @@ static void pcfx_pcfv_reset_state(void) {
     g_field_counter = 0;
     g_vblank_latched_frames = 0;
     g_rainbow_visible_fields = 0;
-    g_mp2_sync_pauses = 0;
-    g_mp2_sync_resumes = 0;
     g_video_buffer_stride_words = VIDEO_BUFFER_STRIDE_DEFAULT;
     /* Per-pass state: LOOP playback reopens the stream, and "nothing presented
        yet" gates prebuffer, urgent audio fetch and the A/V window.  Without
@@ -1437,9 +1213,8 @@ static void pcfx_pcfv_reset_state(void) {
        sat out the whole hidden-preroll guard on black, then ran video
        unclocked at CD speed with no sound. */
     g_video_frames_presented = 0;
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    g_mp2_enabled = 0u;
-    g_mp2_decode_budget_used = 0u;
+#if defined(PCFX_PCFV_HAVE_AUDIO)
+    pcfv_audio_reset();
 #endif
 }
 
@@ -1465,13 +1240,10 @@ int pcfx_pcfv_open(uint32_t stream_lba, const PcfxPcfvOptions *opt) {
 
     if (!g_stream_lba) return 0;
     pcfv_boot_stream_async();
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    /* Do not initialize the PSG timer/IRQ before the RAINBOW player has
-       configured video and completed its CD prebuffer.  The MP2 data itself
-       can be read early, but timer setup before PCFV boot leaves this build on
-       a black screen in headless PC-FX validation. */
-    if (g_audio_codec != PCFV_AUDIO_CODEC_MP2) pcfv_mp2_prepare_loaded();
-#endif
+    /* Audio that needs timers/IRQs (a preloaded MP2 asset) starts only after
+       the RAINBOW boot: arming the PSG timer earlier left headless PC-FX
+       validation on a black screen. */
+    audio_after_boot();
 
     return 1;
 }
@@ -1480,12 +1252,11 @@ static uint16_t pcfx_pcfv_fields_per_frame(void) {
     uint32_t rounded;
     if (!g_fps_num) return 1;
     rounded = ((60u * (uint32_t)g_fps_den) + ((uint32_t)g_fps_num / 2u)) / (uint32_t)g_fps_num;
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    /* MP2 playback is the pitch-correct continuous clock.  Do not pace RAINBOW
-       by a fixed field count under MP2; the latch path gates to audio PTS and
-       may catch up/skip stale frames if CD loading was late. */
-    if (g_audio_codec == PCFV_AUDIO_CODEC_MP2) return 1u;
-#endif
+    /* Streamed audio (MP2's PSG timer, ADPCM's KING clock) is the
+       pitch-correct continuous clock.  Do not pace RAINBOW by a fixed field
+       count then; the latch path gates to the audio clock and may catch
+       up/skip stale frames if CD loading was late. */
+    if (audio_is_clock()) return 1u;
     if (rounded < 1u) rounded = 1u;
     if (rounded > 10u) rounded = 10u;
     return (uint16_t)rounded;
@@ -1503,14 +1274,8 @@ void pcfx_pcfv_set_paused(int paused) {
     if (g_paused == want) return;
     g_paused = want;
 
-    /* Keep the current RAINBOW buffer latched.  For audio, disabling KING ch0
-       pauses the ADPCM address engine; reenabling with the same rate/control
-       word resumes from the current ADPCM pointer on the target model used by
-       this player. */
-    if (g_adpcm_started) {
-        if (g_paused) king_write_reg16(0x50, 0x0000);
-        else king_write_reg16(0x50, g_adpcm_control_word);
-    }
+    /* Keep the current RAINBOW buffer latched; the backend freezes its clock. */
+    audio_set_paused(g_paused);
 }
 
 void pcfx_pcfv_toggle_paused(void) { pcfx_pcfv_set_paused(!g_paused); }
@@ -1525,33 +1290,21 @@ static int pcfx_pcfv_handle_buttons(void) {
 }
 
 static int pcfv_audio_playback_complete(void) {
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    if (g_audio_codec == PCFV_AUDIO_CODEC_MP2 && g_mp2_enabled) {
-        return pcfx_mp2_async_done(&g_mp2_async) ? 1 : 0;
-    }
-#endif
-    return 1;
+    return audio_complete();
 }
 
 static uint16_t pcfv_audio_target_frame_for_sync(void) {
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
     uint64_t n;
-    if (g_audio_codec != PCFV_AUDIO_CODEC_MP2 || !g_audio_rate_hz || !g_fps_den) return g_next_display_frame;
-    if (!pcfx_mp2_async_started(&g_mp2_async)) return g_next_display_frame;
-    n = (uint64_t)pcfx_mp2_async_samples_emitted() * (uint64_t)g_fps_num;
+    if (!audio_clock_running() || !g_audio_rate_hz || !g_fps_den) return g_next_display_frame;
+    n = (uint64_t)audio_clock() * (uint64_t)g_fps_num;
     n /= ((uint64_t)g_audio_rate_hz * (uint64_t)g_fps_den);
     if (n >= g_frame_count) return (g_frame_count ? (uint16_t)(g_frame_count - 1u) : 0u);
     return (uint16_t)n;
-#else
-    return g_next_display_frame;
-#endif
 }
 
 static int pcfv_video_due_for_audio_clock(void) {
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
     uint16_t target;
-    if (g_audio_codec != PCFV_AUDIO_CODEC_MP2) return 1;
-    if (!pcfx_mp2_async_started(&g_mp2_async)) return 1;
+    if (!audio_clock_running()) return 1;
     target = pcfv_audio_target_frame_for_sync();
     if (!g_loop_playback && g_next_display_frame > target) return 0;
     if (!g_loop_playback) return 1;
@@ -1559,9 +1312,6 @@ static int pcfv_video_due_for_audio_clock(void) {
         return g_next_display_frame <= target;
     }
     return 0;
-#else
-    return 1;
-#endif
 }
 
 static int pcfv_latch_ready_display_frame(void) {
@@ -1577,8 +1327,7 @@ static int pcfv_latch_ready_display_frame(void) {
     bi = (g_next_display_frame < g_frame_count) ? find_video_buf_for_frame(g_next_display_frame) : -1;
     if (bi < 0 && g_next_display_frame < g_frame_count) {
         uint16_t max_skip = VIDEO_SKIP_SEARCH;
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-        if (g_audio_codec == PCFV_AUDIO_CODEC_MP2) {
+        if (audio_is_clock()) {
             uint16_t audio_target = pcfv_audio_target_frame_for_sync();
             if (!g_loop_playback) {
                 if (audio_target > g_next_display_frame) {
@@ -1590,7 +1339,6 @@ static int pcfv_latch_ready_display_frame(void) {
                 if (ahead > max_skip) max_skip = (ahead > VIDEO_SYNC_SKIP_MAX) ? VIDEO_SYNC_SKIP_MAX : ahead;
             }
         }
-#endif
         bi = find_best_ready_video_buf(g_next_display_frame, max_skip, &skipped);
     }
 
@@ -1624,9 +1372,7 @@ static int pcfv_latch_ready_display_frame(void) {
 int pcfx_pcfv_update(void) {
     uint16_t i;
 
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    g_mp2_decode_budget_used = 0u;
-#endif
+    audio_new_field();
 
     if (!g_fields_per_frame) g_fields_per_frame = pcfx_pcfv_fields_per_frame();
     if (g_abort || g_done) return 0;
@@ -1635,9 +1381,8 @@ int pcfx_pcfv_update(void) {
     if (g_paused) {
         while (tetsu_raster_stable() < RAINBOW_RESTART_RASTER) {
             if (g_seek_in_progress) {
-                poll_adpcm_refill();
                 scheduler_poll();
-                pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
+                audio_service();
                 scheduler_start_if_idle();
             } else {
                 cd_dma_poll_budget(SCHEDULER_POLL_BUDGET);
@@ -1653,23 +1398,21 @@ int pcfx_pcfv_update(void) {
         }
         while (tetsu_raster_stable() >= RAINBOW_RESTART_RASTER) {
             if (g_seek_in_progress) {
-                poll_adpcm_refill();
                 scheduler_poll();
-                pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
+                audio_service();
                 scheduler_start_if_idle();
             } else {
                 cd_dma_poll_budget(SCHEDULER_POLL_BUDGET);
             }
             if (pcfx_pcfv_handle_buttons()) { g_abort = 1; return 0; }
         }
+        g_audio_clock_samples = audio_clock();
         return 1;
     }
 
     while (tetsu_raster_stable() < RAINBOW_RESTART_RASTER) {
-        poll_adpcm_refill();
         scheduler_poll();
-        pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
-        pcfv_mp2_sync_to_video();
+        audio_service();
         scheduler_start_if_idle();
         if (g_cd_dma.state == CD_DMA_ERROR) {
             g_scsi_dma_late_frames++;
@@ -1680,7 +1423,9 @@ int pcfx_pcfv_update(void) {
 
     age_ready_video_buffers();
 
-    if (g_field_counter == 0) {
+    /* II can pause inside the poll loop above: then neither advance video nor
+       (re)start audio for the rest of this field. */
+    if (g_field_counter == 0 && !g_paused) {
         /* During hidden HuC6271 warm-up, keep restarting the first decoded
            RAINBOW frame instead of consuming the timeline.  Advancing hidden
            frames made video start several frames ahead of MP2. */
@@ -1698,42 +1443,36 @@ int pcfx_pcfv_update(void) {
             g_rainbow_visible_fields = 0;
             g_field_counter = 0;
         }
-        if (g_rainbow_visible) {
+        /* While a seek is prebuffering, the old frame is still on screen:
+           audio waits for the target frame's first visible field. */
+        if (g_rainbow_visible && !g_seek_in_progress && !g_paused) {
             g_rainbow_visible_fields++;
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-            if (g_mp2_enabled && g_rainbow_visible_fields >= AUDIO_START_AFTER_VISIBLE_FIELDS) {
-                pcfv_mp2_start_if_ready();
-                if (!g_audio_start_latch_frame && pcfx_mp2_async_playing()) {
+            if (g_rainbow_visible_fields >= AUDIO_START_AFTER_VISIBLE_FIELDS) {
+                audio_visible_field();
+                if (!g_audio_start_latch_frame && audio_playing()) {
                     g_audio_start_latch_frame = g_vblank_latched_frames;
                     g_audio_start_visible_fields = g_rainbow_visible_fields;
-                    g_audio_start_ring_used = pcfx_mp2_async_ring_used();
-                    g_audio_start_samples_emitted = pcfx_mp2_async_samples_emitted();
+                    g_audio_start_ring_used = audio_buffered();
+                    g_audio_start_samples_emitted = audio_clock();
                 }
-            } else
-#endif
-            if (g_audio_codec == PCFV_AUDIO_CODEC_ADPCM && g_audio_bytes && !g_adpcm_started && g_audio_preroll_ready &&
-                g_rainbow_visible_fields >= AUDIO_START_AFTER_VISIBLE_FIELDS) {
-                setup_adpcm_audio();
-                g_audio_start_latch_frame = g_vblank_latched_frames;
             }
         }
     }
 
-    poll_adpcm_refill();
     scheduler_poll();
+    audio_service();
     scheduler_start_if_idle();
 
     while (tetsu_raster_stable() >= RAINBOW_RESTART_RASTER) {
-        poll_adpcm_refill();
         for (i = 0; i < 2u; ++i) scheduler_poll();
-        pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
-        pcfv_mp2_sync_to_video();
+        audio_service();
         scheduler_start_if_idle();
         if (pcfx_pcfv_handle_buttons()) { g_abort = 1; return 0; }
     }
 
     g_field_counter++;
     if (g_field_counter >= g_fields_per_frame) g_field_counter = 0;
+    g_audio_clock_samples = audio_clock();
     if (g_next_display_frame >= g_frame_count && pcfv_audio_playback_complete()) g_done = 1;
     return !g_done && !g_abort;
 }
@@ -1783,24 +1522,12 @@ int pcfx_pcfv_seek_frame(uint16_t frame_index) {
     was_paused = g_paused;
     cd_dma_cancel_for_seek();
 
-    /* Stop audio immediately.  It will be re-primed from the closest authored
-       ADPCM chunk and restarted only after the requested video frame has been
-       latched.  That keeps sector seeks from producing audio-over-old-video. */
-    king_write_reg16(0x50, 0x0000);
-    g_adpcm_started = 0;
-    g_adpcm_control_word = 0;
-    g_audio_preroll_ready = 0;
-    g_pending_audio_half0 = 0;
-    g_pending_audio_half1 = 0;
-    g_audio_refills_completed = 0;
+    /* Stop audio immediately.  The backend re-primes from the audio for the
+       target frame and restarts only on the target frame's first visible
+       field, so a seek never plays new audio over the old picture. */
+    audio_seek(frame_index);
 
     g_start_frame = frame_index;
-    if (g_audio_codec == PCFV_AUDIO_CODEC_ADPCM) {
-        pcfv_prepare_audio_seek(frame_index);
-        if (!g_audio_bytes || !g_audio_preroll_run_sectors) g_audio_preroll_ready = 1;
-    } else {
-        g_audio_preroll_ready = 1;
-    }
 
     setup_video_buffers_for_seek(frame_index, 1);
     g_seek_in_progress = 1;
@@ -1828,12 +1555,7 @@ int pcfx_pcfv_seek_data_sector(uint32_t data_relative_sector) {
 
 void pcfx_pcfv_stop(void) {
     king_write_reg16(0x40, 0x0000);
-    king_write_reg16(0x50, 0x0000);
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-    if (g_mp2_enabled) pcfx_mp2_async_stop(&g_mp2_async);
-#endif
-    g_adpcm_started = 0;
-    g_adpcm_control_word = 0;
+    audio_stop();
     g_paused = 0;
     set_rainbow_visible(0);
 }
@@ -1974,26 +1696,8 @@ int pcfx_pcfv_play_loop(uint32_t stream_lba, uint16_t stop_buttons) {
 }
 
 
-#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
-int pcfx_pcfv_mp2_load_from_cd(uint32_t mp2_lba, uint32_t mp2_size_bytes) {
-    g_mp2_loaded = 0u;
-    g_mp2_enabled = 0u;
-    g_mp2_size_bytes = 0u;
-    if (!pcfx_mp2_load_cd(mp2_lba, mp2_size_bytes)) {
-        return 0;
-    }
-    /* Only preload the MP2 bytes here.  Timer/IRQ setup and the initial decode
-       preroll are deferred until after PCFV's RAINBOW boot/prebuffer phase. */
-    g_mp2_loaded = 1u;
-    g_mp2_size_bytes = mp2_size_bytes;
-    return 1;
-}
-uint32_t pcfx_pcfv_mp2_frames_decoded(void) { return g_mp2_async.frames_decoded; }
-uint32_t pcfx_pcfv_mp2_underflows(void) { return pcfx_mp2_async_underflows(); }
-uint32_t pcfx_pcfv_mp2_ring_used(void) { return pcfx_mp2_async_ring_used(); }
-uint32_t pcfx_pcfv_mp2_error_code(void) { return g_mp2_async.error_code; }
-uint32_t pcfx_pcfv_mp2_error_offset(void) { return g_mp2_async.error_offset; }
-#else
+/* MP2 builds implement these in pcfv_mp2_stream.c. */
+#if !defined(PCFX_PCFV_AUDIO_MP2)
 int pcfx_pcfv_mp2_load_from_cd(uint32_t mp2_lba, uint32_t mp2_size_bytes) { (void)mp2_lba; (void)mp2_size_bytes; return 0; }
 uint32_t pcfx_pcfv_mp2_frames_decoded(void) { return 0; }
 uint32_t pcfx_pcfv_mp2_underflows(void) { return 0; }
