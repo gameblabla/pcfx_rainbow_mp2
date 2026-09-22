@@ -1,8 +1,8 @@
 #include <stdint.h>
 #include <string.h>
-#include <eris/v810.h>
+#include <pcfx/v810.h>
 #include <eris/cd.h>
-#include <eris/low/scsi.h>
+#include <eris/scsi.h>
 #include "pcfx_mp2_async.h"
 #include "psg_sample.h"
 
@@ -85,7 +85,7 @@ int pcfx_mp2_load_cd(uint32_t lba, uint32_t size_bytes)
     uint32_t rounded;
     if (!lba || !size_bytes || size_bytes > PCFX_MP2_PRELOAD_MAX_BYTES) return 0;
     rounded = (size_bytes + 2047u) & ~2047u;
-    eris_low_scsi_reset();
+    scsi_reset();
     return pcfx_cd_read_safe(lba, g_pcfx_mp2_preload_buf, rounded) ? 1 : 0;
 }
 
@@ -195,12 +195,12 @@ int pcfx_mp2_stream_read_cd(PcfxMp2Async *s, uint32_t lba, uint32_t byte_offset,
     if (byte_offset + real_bytes > s->size) real_bytes = s->size - byte_offset;
     free_bytes = pcfx_mp2_stream_free_bytes(s);
     if (free_bytes < real_bytes) return 0;
-    eris_low_scsi_reset();
+    scsi_reset();
     if (!pcfx_cd_read_safe(lba, g_mp2_chunk_tmp, read_bytes)) {
-        eris_low_scsi_reset();
+        scsi_reset();
         return 0;
     }
-    eris_low_scsi_reset();
+    scsi_reset();
     return pcfx_mp2_stream_append_bytes(s, byte_offset, g_mp2_chunk_tmp, real_bytes);
 }
 

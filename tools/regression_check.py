@@ -256,6 +256,12 @@ def visual_report(frames_dir:pathlib.Path, source:pathlib.Path, stats:List[Tuple
         black_bottom=float(np.mean(gray[gray.shape[0]//2:,:] < 8.0))
         ref_black_bottom=float(np.mean(rgray[rgray.shape[0]//2:,:] < 8.0))
         mae=float(np.mean(np.abs(em-rf)))
+        # RAINBOW starvation (strip byte budget short of the stored entropy, e.g.
+        # sizes that count unstuffed FF bytes) corrupts the LAST macroblock
+        # columns of each strip first: the right edge goes bad while the body
+        # still matches.  Compare the right 16px band with the body.
+        edge_mae=float(np.mean(np.abs(em[:,240:]-rf[:,240:])))
+        body_mae=float(np.mean(np.abs(em[:,16:240]-rf[:,16:240])))
         corr=float(np.corrcoef(em.ravel(), rf.ravel())[0,1]) if np.std(em)>1e-6 and np.std(rf)>1e-6 else 0.0
         # Rolling/corrupt RAINBOW failures usually appear as a black lower field
         # or a top/bottom split.  This catches the exact regression that slipped
@@ -270,11 +276,14 @@ def visual_report(frames_dir:pathlib.Path, source:pathlib.Path, stats:List[Tuple
             ok=False; reasons.append(f'MAE {mae:.2f}')
         if corr < 0.45:
             ok=False; reasons.append(f'corr {corr:.3f}')
+        if edge_mae > 2.0*body_mae + 12.0:
+            ok=False; reasons.append(f'right-edge band MAE {edge_mae:.1f} vs body {body_mae:.1f} (RAINBOW strip starvation?)')
         if not ok:
             failures.append(f'{img.name}: visual mismatch: ' + ', '.join(reasons))
         checks.append(dict(name=img.name, stats=name, source_frame=src_idx, video_frames_presented=vf,
                            black_total=black_total, black_bottom=black_bottom,
                            source_black_bottom=ref_black_bottom, mae=mae, correlation=corr,
+                           edge_mae=edge_mae, body_mae=body_mae,
                            pass_=ok, reasons=reasons))
     return dict(pass_=not failures, failures=failures, checks=checks)
 

@@ -1,6 +1,6 @@
-#include <eris/types.h>
-#include <eris/v810.h>
-#include <eris/timer.h>
+#include <pcfx/types.h>
+#include <pcfx/v810.h>
+#include <pcfx/timer.h>
 #include "psg_sample.h"
 
 #define TIMER_PORT_CONTROL    0xF00
@@ -146,7 +146,7 @@ static inline void psg_setup_pair(uint32_t high_ch, uint32_t low_ch, uint32_t ba
 
 static inline void timer_start_direct(void)
 {
-    eris_timer_start(1);
+    timer_start(1);
 }
 
 void PSG10MP2_StartMono(void)
@@ -444,8 +444,8 @@ static void PSG10MP2_InitTimerWithHandler(int period, uint32_t frac_16_16, void 
     g_mp2psg10_timer_period_base = (uint32_t)period;
     g_mp2psg10_timer_period_frac = frac_16_16;
     g_mp2psg10_timer_period_accum = 0;
-    eris_timer_init();
-    eris_timer_set_period(period);
+    timer_init();
+    timer_set_period(period);
     irq_set_level(8);
     irq_enable();
 }

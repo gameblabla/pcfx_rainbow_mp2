@@ -1,13 +1,16 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <eris/king.h>
-#include <eris/tetsu.h>
-#include <eris/7up.h>
-#include <eris/low/7up.h>
-#include <eris/low/soundbox.h>
-#include <eris/low/scsi.h>
-#include <eris/pad.h>
+#include <pcfx/king.h>
+#include <pcfx/tetsu.h>
+#include <pcfx/vdc.h>
+#include <pcfx/v810.h>
+#include <pcfx/sound.h>
+#include <pcfx/contrlr.h>
+/* From libpcfx <eris/scsi.h>, declared here because that header's SCSI_PHASE_*
+   enumerators collide with this file's own non-blocking SCSI state machine. */
+void scsi_reset(void);
+void eris_scsi_abort(void);
 #include "pcfx_pcfv_player.h"
 #if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
 #include "pcfx_mp2_async.h"
@@ -161,14 +164,29 @@ static uint32_t rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static inline int vblank_active(void) {
-    volatile uint16_t * const sr = (volatile uint16_t *)0x80000400u;
-    return ((*sr & 0x0020u) != 0);
+/* Frame timing comes from the Tetsu raster counter, never from the VDC status
+   VD bit: VD is only raised while VDC CR bit 3 (vblank IRQ enable) is set, and
+   setup_video() writes CR = BB only, so polling VD at 0x80000400 spins forever.
+   The counter must be read twice until two reads agree (HuC6261 latch bug);
+   see PCFX_Skills/pcfx-frame-timing.  262-line mode: EVB = 22, SVB = 262. */
+static inline uint16_t tetsu_raster_stable(void) {
+    uint16_t a, b;
+    do {
+        a = (uint16_t)tetsu_get_raster();
+        b = (uint16_t)tetsu_get_raster();
+    } while (a != b);
+    return a;
 }
 
+static inline int vblank_active(void) {
+    uint16_t r = tetsu_raster_stable();
+    return r >= 262u || r < 22u;
+}
+
+/* Returns on the leading edge of the next vertical blank. */
 static void wait_vblank(void) {
-    while (!vblank_active()) { }
     while (vblank_active()) { }
+    while (!vblank_active()) { }
 }
 
 /* -------------------------------------------------------------------------
@@ -469,6 +487,7 @@ static int scsi_check_king_dma(void) {
 }
 
 static void scsi_stop_king_dma_no_eat(void) {
+    king_write_reg16(0x0B, 0x0000); /* disarm DMA on every teardown */
     scsi_reg_w(0x02, 0x0000);
     scsi_reg_w(0x03, 0x0000);
 }
@@ -478,8 +497,8 @@ static void scsi_ack_assert(uint16_t ack_value) {
 }
 
 static void scsi_bus_abort_reset(void) {
-    eris_low_scsi_abort();
-    eris_low_scsi_reset();
+    eris_scsi_abort();
+    scsi_reset();
 }
 
 static int cd_dma_is_busy(void) {
@@ -754,34 +773,35 @@ static void setup_rainbow_regs(void) {
 }
 
 static void setup_video(void) {
-    eris_king_init();
-    eris_tetsu_init();
+    king_init();
+    king_set_kram_mode(1); /* 4-Mbit KRAM mode before access */
+    tetsu_init();
 
-    eris_king_set_kram_pages(0, 0, 0, 0);
-    eris_king_set_bg_prio(KING_BGPRIO_HIDE, KING_BGPRIO_HIDE, KING_BGPRIO_HIDE, KING_BGPRIO_HIDE, 0);
-    eris_king_set_bg_mode(KING_BGMODE_NONE, KING_BGMODE_NONE, KING_BGMODE_NONE, KING_BGMODE_NONE);
+    king_set_kram_pages(0, 0, 0, 0);
+    king_set_bg_prio(KING_BGPRIO_HIDE, KING_BGPRIO_HIDE, KING_BGPRIO_HIDE, KING_BGPRIO_HIDE, 0);
+    king_set_bg_mode(KING_BGMODE_NONE, KING_BGMODE_NONE, KING_BGMODE_NONE, KING_BGMODE_NONE);
 
-    eris_tetsu_set_7up_palette(0, 0);
-    eris_tetsu_set_king_palette(0, 0, 0, 0);
-    eris_tetsu_set_rainbow_palette(0);
-    eris_tetsu_set_priorities(0, 0, 0, 0, 0, 0, 0);
+    tetsu_set_vdc_palette(0, 0);
+    tetsu_set_king_palette(0, 0, 0, 0);
+    tetsu_set_rainbow_palette(0);
+    tetsu_set_priorities(0, 0, 0, 0, 0, 0, 0);
     g_rainbow_visible = 0;
     /* Keep RAINBOW fetch enabled from boot, but with output priority zero.
        That lets the HuC6271 pipeline warm without showing the layer. */
-    eris_tetsu_set_video_mode(TETSU_LINES_262, 0, TETSU_DOTCLOCK_5MHz,
+    tetsu_set_video_mode(TETSU_LINES_262, 0, TETSU_DOTCLOCK_5MHz,
                               TETSU_COLORS_256, TETSU_COLORS_16,
                               0, 0, 0, 0, 0, 0, 1);
 
-    eris_low_sup_set_control(0, 0, 1, 0);
-    eris_low_sup_set_control(1, 0, 1, 0);
+    vdc_setreg(0, VDC_REG_CR, VDC_CR_BB);
+    vdc_setreg(1, VDC_REG_CR, VDC_CR_BB);
 }
 
 static void set_rainbow_visible(uint8_t visible) {
-    eris_tetsu_set_priorities(0, 0, 0, 0, 0, 0, visible ? 7 : 0);
+    tetsu_set_priorities(0, 0, 0, 0, 0, 0, visible ? 7 : 0);
     /* Keep the RAINBOW video-mode bit enabled even when hidden.  Visibility is
        controlled by priority only, so hidden warm-up fields still exercise the
        RAINBOW scanout path instead of creating a first-visible pipeline fill. */
-    eris_tetsu_set_video_mode(TETSU_LINES_262, 0, TETSU_DOTCLOCK_5MHz,
+    tetsu_set_video_mode(TETSU_LINES_262, 0, TETSU_DOTCLOCK_5MHz,
                               TETSU_COLORS_256, TETSU_COLORS_16,
                               0, 0, 0, 0, 0, 0, 1);
     g_rainbow_visible = visible ? 1 : 0;
@@ -818,6 +838,7 @@ static int parse_pcfv_header(void) {
 
     g_fps_num = rd16(g_pcfv_head + 12);
     g_fps_den = rd16(g_pcfv_head + 14);
+    if (!g_fps_num || !g_fps_den || (uint32_t)g_fps_num > 60u * g_fps_den) return 0;
     g_frame_count = rd16(g_pcfv_head + 16);
     g_pcfv_flags = rd16(g_pcfv_head + 18);
     if (g_frame_count == 0 || g_frame_count > PCFV_MAX_FRAMES) return 0;
@@ -856,7 +877,13 @@ static int parse_pcfv_header(void) {
             g_entries[i].audio_sectors = rd32(e + 20);
             g_entries[i].audio_byte_offset = rd32(e + 24);
             g_entries[i].flags = rd32(e + 28);
-            if (!g_entries[i].video_sectors) return 0;
+            /* A batched DMA must have the same disc and KRAM slot stride. */
+            if (g_entries[i].video_sectors != rd32(g_pcfv_head + 28) ||
+                !g_entries[i].video_size ||
+                g_entries[i].video_size > g_entries[i].video_sectors * PCFV_SECTOR_SIZE ||
+                g_entries[i].video_sector < g_data_start_sector) return 0;
+            if (g_audio_codec == PCFV_AUDIO_CODEC_MP2 &&
+                g_entries[i].audio_sectors > PCFX_MP2_STREAM_CHUNK_MAX_SECTORS) return 0;
             if (g_entries[i].audio_sectors && g_audio_chunk_count < PCFV_MAX_AUDIO_CHUNKS) {
                 g_audio_chunks[g_audio_chunk_count].sector = g_entries[i].audio_sector;
                 g_audio_chunks[g_audio_chunk_count].sectors = g_entries[i].audio_sectors;
@@ -1252,11 +1279,11 @@ static void poll_adpcm_refill(void) {
 }
 
 static void setup_adpcm_audio(void) {
-    eris_king_set_kram_pages(0, 0, 0, 0);
-    eris_low_adpcm_set_control(pcfx_adpcm_rate_enum(g_audio_rate_hz), 1, 1, 1, 1);
-    eris_low_adpcm_set_volume(0, 63, 63);
-    eris_low_adpcm_set_volume(1, 0, 0);
-    eris_low_cdda_set_volume(0, 0);
+    king_set_kram_pages(0, 0, 0, 0);
+    adpcm_set_control(pcfx_adpcm_rate_enum(g_audio_rate_hz), 1, 1, 1, 1);
+    adpcm_set_volume(0, 63, 63);
+    adpcm_set_volume(1, 0, 0);
+    cdda_set_volume(0, 0);
 
     king_write_reg16(0x50, 0x0000);
     king_write_reg16(0x51, 0x0001);
@@ -1265,7 +1292,7 @@ static void setup_adpcm_audio(void) {
     king_write_reg32(0x59, KRAM_ADPCM_WORD_ADDR + ADPCM_RING_WORDS - 1u);
     king_write_reg16(0x5A, (uint16_t)((KRAM_ADPCM_WORD_ADDR + ADPCM_HALF_WORDS) >> 6));
 
-    eris_low_adpcm_set_control(pcfx_adpcm_rate_enum(g_audio_rate_hz), 1, 1, 0, 0);
+    adpcm_set_control(pcfx_adpcm_rate_enum(g_audio_rate_hz), 1, 1, 0, 0);
     (void)king_read_reg16(0x53);
     g_adpcm_control_word = (uint16_t)(PCFX_KING_ADPCM_CH0_ENABLE | (pcfx_adpcm_rate_bits(g_audio_rate_hz) << 2));
     king_write_reg16(0x50, g_adpcm_control_word);
@@ -1404,14 +1431,24 @@ static void pcfx_pcfv_reset_state(void) {
     g_mp2_sync_pauses = 0;
     g_mp2_sync_resumes = 0;
     g_video_buffer_stride_words = VIDEO_BUFFER_STRIDE_DEFAULT;
+    /* Per-pass state: LOOP playback reopens the stream, and "nothing presented
+       yet" gates prebuffer, urgent audio fetch and the A/V window.  Without
+       these the second pass kept the finished MP2 decoder (never restarted),
+       sat out the whole hidden-preroll guard on black, then ran video
+       unclocked at CD speed with no sound. */
+    g_video_frames_presented = 0;
+#if defined(PCFX_PCFV_USE_MP2) && PCFX_PCFV_USE_MP2
+    g_mp2_enabled = 0u;
+    g_mp2_decode_budget_used = 0u;
+#endif
 }
 
 int pcfx_pcfv_open(uint32_t stream_lba, const PcfxPcfvOptions *opt) {
     pcfx_pcfv_reset_state();
     setup_video();
     setup_rainbow_regs();
-    eris_pad_init(0);
-    eris_low_scsi_reset();
+    contrlr_pad_init(0);
+    scsi_reset();
 
     g_stream_lba = stream_lba;
     g_stop_buttons = (opt && opt->stop_buttons) ? opt->stop_buttons : PCFX_PCFV_BTN_START;
@@ -1424,7 +1461,7 @@ int pcfx_pcfv_open(uint32_t stream_lba, const PcfxPcfvOptions *opt) {
     g_loop_playback = 0;
     g_done = 0;
     g_abort = 0;
-    g_prev_pad = eris_pad_read(0);
+    g_prev_pad = contrlr_pad_read(0);
 
     if (!g_stream_lba) return 0;
     pcfv_boot_stream_async();
@@ -1455,7 +1492,7 @@ static uint16_t pcfx_pcfv_fields_per_frame(void) {
 }
 
 static uint32_t pcfx_pcfv_pad_pressed(void) {
-    uint32_t raw = eris_pad_read(0);
+    uint32_t raw = contrlr_pad_read(0);
     uint32_t pressed = raw & ~g_prev_pad;
     g_prev_pad = raw;
     return pressed;
@@ -1596,7 +1633,7 @@ int pcfx_pcfv_update(void) {
     if (pcfx_pcfv_handle_buttons()) { g_abort = 1; return 0; }
 
     if (g_paused) {
-        while ((uint16_t)eris_tetsu_get_raster() < RAINBOW_RESTART_RASTER) {
+        while (tetsu_raster_stable() < RAINBOW_RESTART_RASTER) {
             if (g_seek_in_progress) {
                 poll_adpcm_refill();
                 scheduler_poll();
@@ -1614,7 +1651,7 @@ int pcfx_pcfv_update(void) {
         if (g_have_display_buf && g_current_display_buf < VIDEO_BUFFER_COUNT) {
             start_rainbow_frame(g_video_kram[g_current_display_buf], 15);
         }
-        while ((uint16_t)eris_tetsu_get_raster() >= RAINBOW_RESTART_RASTER) {
+        while (tetsu_raster_stable() >= RAINBOW_RESTART_RASTER) {
             if (g_seek_in_progress) {
                 poll_adpcm_refill();
                 scheduler_poll();
@@ -1628,7 +1665,7 @@ int pcfx_pcfv_update(void) {
         return 1;
     }
 
-    while ((uint16_t)eris_tetsu_get_raster() < RAINBOW_RESTART_RASTER) {
+    while (tetsu_raster_stable() < RAINBOW_RESTART_RASTER) {
         poll_adpcm_refill();
         scheduler_poll();
         pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);
@@ -1686,7 +1723,7 @@ int pcfx_pcfv_update(void) {
     scheduler_poll();
     scheduler_start_if_idle();
 
-    while ((uint16_t)eris_tetsu_get_raster() >= RAINBOW_RESTART_RASTER) {
+    while (tetsu_raster_stable() >= RAINBOW_RESTART_RASTER) {
         poll_adpcm_refill();
         for (i = 0; i < 2u; ++i) scheduler_poll();
         pcfv_mp2_decode_budget(PCFV_MP2_FIELD_BUDGET);

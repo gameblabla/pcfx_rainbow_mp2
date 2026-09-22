@@ -1,140 +1,84 @@
-ROOT ?= .
-PREFIX ?= v810
-V810GCC ?= /opt/v810-gcc
-PATH_PREFIX := $(V810GCC)/bin
-CC := $(PATH_PREFIX)/$(PREFIX)-gcc
-LD := $(PATH_PREFIX)/$(PREFIX)-ld
-OBJCOPY := $(PATH_PREFIX)/$(PREFIX)-objcopy
-HOSTCC ?= gcc
+# Portable PCFV/MP2 player. Asset creation is explicit; cd accepts a ready stream.
+#   make cd                                  build the disc from assets/stream.pcfv
+#   make encode VIDEO_IN=movie.mkv           re-encode the stream (MPCONV-conformant)
+#   make validate [VIDEO_IN=movie.mkv]       emulator gate: frames, audio, glitches
+#   make test                                host tests for tools/rainbow
+ROOT := $(abspath ..)
+V810_GCC ?= $(if $(V810GCC),$(V810GCC),$(ROOT)/toolchain/v810-gcc)
+V810GCC ?= $(V810_GCC)
+LIBPCFX ?= $(ROOT)/vendor/libpcfx
+CC := $(V810_GCC)/bin/v810-gcc
+LD := $(V810_GCC)/bin/v810-ld
+OBJCOPY := $(V810_GCC)/bin/v810-objcopy
+PCFX_CDLINK ?= $(ROOT)/toolchain/bin/pcfx-cdlink-large
+PYTHON ?= python3
 FFMPEG ?= ffmpeg
-PCFX_CDLINK ?= $(ROOT)/tools/pcfxtools/pcfx-cdlink
-PCFV_ENCODE ?= $(ROOT)/build/pcfv_encode
-
 TARGET := pcfv_rainbow_mp2_player
 OBJDIR := build
-ELF := $(OBJDIR)/$(TARGET).elf
-BIN := $(OBJDIR)/$(TARGET).program.bin
-MAP := $(OBJDIR)/$(TARGET).map
-CDLINK := $(OBJDIR)/cdlink.txt
-AUDIO_INFO := $(OBJDIR)/generated_audio_info.h
-VIDEO_IN ?= data/sailor.mkv
-VIDEO_ONLY_STREAM := assets/video_only.pcfv
-STREAM := assets/stream.pcfv
-AUDIO_MP2 := assets/audio.mp2
-MP2_LEAD_SECTORS ?= 4
-MP2_CHUNK_SECTORS ?= 4
-FRAMES ?= 0
+STREAM ?= assets/stream.pcfv
+VIDEO_IN ?=
 FPS ?= 15
-QUALITY ?= 82
-RDO ?= 8
+FRAMES ?= 0
+SCALE ?= auto
+JOBS ?= 4
+AUDIO ?= mp2
+# 10-bit PSG sample playback is quiet; the shipped asset was encoded with +8 dB.
+AUDIO_GAIN_DB ?= 8
+FIT ?= stretch
 MAX_FRAME_SECTORS ?= 4
-MIN_QUALITY ?= 58
-JOBS ?= 0
+MAX_STRIP_BYTES ?= 0
 LOOP ?= 0
+CFLAGS := -O3 -fomit-frame-pointer -fno-builtin -ffunction-sections -fdata-sections \
+          -Wall -Wextra -std=gnu99 -mv810 -mprolog-function -msda=0 \
+          -Isrc -I$(OBJDIR) -I$(LIBPCFX)/include -I$(V810_GCC)/include \
+          -DPCFX_PCFV_EXAMPLE_LOOP=$(LOOP) -DPCFX_PCFV_USE_MP2=1 -DHAVE_GENERATED_LBAS
+GCC_LIBDIR := $(firstword $(sort $(wildcard $(V810_GCC)/lib/gcc/v810/*)))
+LDFLAGS := -T$(LIBPCFX)/ldscripts/v810.x -L$(LIBPCFX) -L$(V810_GCC)/v810/lib \
+           -L$(GCC_LIBDIR) $(LIBPCFX)/src/crt0.o --gc-sections
+LIBS := -lpcfx -lc -lsim -lnosys -lgcc
+OBJS := $(addprefix $(OBJDIR)/,main.o pcfx_pcfv_player.o pcfx_mp2_async.o kjmp2_fast.o psg_sample.o)
 
-INCLUDES := -I. -Isrc -I$(OBJDIR) -I$(ROOT)/include -I$(V810GCC)/include -I$(V810GCC)/$(PREFIX)/include
-GCC_LIBDIR := $(firstword $(sort $(wildcard $(V810GCC)/lib/gcc/$(PREFIX)/*)))
-CFLAGS_BASE := -O3 -fomit-frame-pointer -fno-builtin -ffunction-sections -fdata-sections -Wall -Wextra -std=gnu99 -mv810 -mprolog-function -msda=0 $(INCLUDES)
-CFLAGS := $(CFLAGS_BASE) -DPCFX_PCFV_EXAMPLE_LOOP=$(LOOP) -DPCFX_PCFV_USE_MP2=1
-ifneq ($(wildcard lbas.h),)
-CFLAGS += -DHAVE_GENERATED_LBAS
-endif
-ifneq ($(wildcard $(AUDIO_INFO)),)
-CFLAGS += -DHAVE_GENERATED_AUDIO_INFO
-endif
-LDFLAGS := -L$(V810GCC)/lib -L$(V810GCC)/$(PREFIX)/lib -L$(GCC_LIBDIR) $(V810GCC)/$(PREFIX)/lib/crt0.o --gc-sections
-LIBS := -leris -lc -lsim -lnosys -lgcc
-
-OBJS := $(OBJDIR)/main.o $(OBJDIR)/pcfx_pcfv_player.o $(OBJDIR)/pcfx_mp2_async.o $(OBJDIR)/kjmp2_fast.o $(OBJDIR)/psg_sample.o
-
-.PHONY: all cd encode audio clean clean-build clean-output
+.PHONY: all cd program encode repair test validate clean FORCE
 all: cd
 
+# Phony: changes to quality, fps or input must regenerate the asset.
+encode:
+	@test -n "$(VIDEO_IN)" || { echo 'set VIDEO_IN=/path/to/movie'; exit 1; }
+	$(PYTHON) $(ROOT)/tools/rainbow/rainbow.py video "$(VIDEO_IN)" "$(STREAM)" \
+	  --ffmpeg "$(FFMPEG)" --fps $(FPS) --frames $(FRAMES) --scale $(SCALE) \
+	  --jobs $(JOBS) --audio $(AUDIO) --audio-gain-db $(AUDIO_GAIN_DB) --fit $(FIT) \
+	  --max-frame-sectors $(MAX_FRAME_SECTORS) --max-strip-bytes $(MAX_STRIP_BYTES)
+
+repair:
+	@test -n "$(LEGACY_STREAM)" || { echo 'set LEGACY_STREAM=/path/to/old.pcfv'; exit 1; }
+	$(PYTHON) $(ROOT)/tools/rainbow/rainbow.py repair-legacy "$(LEGACY_STREAM)" "$(STREAM)"
+
 $(OBJDIR):
-	mkdir -p $(OBJDIR)
+	mkdir -p $@
 
-$(PCFV_ENCODE): $(ROOT)/tools/pcfv_encode.c
-	$(MAKE) -C $(ROOT) tools
+$(OBJDIR)/%.o: src/%.c $(wildcard src/*.h) $(OBJDIR)/lbas.h FORCE | $(OBJDIR)
+	$(CC) $(CFLAGS) $(if $(filter kjmp2_fast,$*),-fno-unroll-loops,) -c $< -o $@
 
-$(VIDEO_ONLY_STREAM): $(PCFV_ENCODE) $(VIDEO_IN) | $(OBJDIR)
-	mkdir -p assets
-	$(PCFV_ENCODE) --ffmpeg $(FFMPEG) --frames $(FRAMES) --fps $(FPS) \
-		--quality $(QUALITY) --rdo $(RDO) --max-frame-sectors $(MAX_FRAME_SECTORS) \
-		--min-quality $(MIN_QUALITY) --no-audio --tmp $(OBJDIR) \
-		$(if $(filter-out 0,$(JOBS)),--jobs $(JOBS),) \
-		$(VIDEO_IN) $@
+$(OBJDIR)/$(TARGET).elf: $(OBJS)
+	$(LD) $(LDFLAGS) $^ $(LIBS) -o $@ -Map $(OBJDIR)/$(TARGET).map
 
-$(STREAM): $(VIDEO_ONLY_STREAM) $(AUDIO_MP2) tools/mux_pcfv_mp2.py | $(OBJDIR)
-	mkdir -p assets
-	python3 tools/mux_pcfv_mp2.py --lead-sectors $(MP2_LEAD_SECTORS) --chunk-sectors $(MP2_CHUNK_SECTORS) $(VIDEO_ONLY_STREAM) $(AUDIO_MP2) $@
-
-$(AUDIO_MP2): $(VIDEO_IN) | $(OBJDIR)
-	mkdir -p assets
-	$(FFMPEG) -y -hide_banner -i $(VIDEO_IN) -map 0:a:0 -vn -af volume=8dB -ac 1 -ar 16000 -b:a 32k -c:a mp2 $@
-
-$(AUDIO_INFO): $(AUDIO_MP2) | $(OBJDIR)
-	@sz=$$(stat -c%s $(AUDIO_MP2)); \
-	{ echo '#ifndef GENERATED_AUDIO_INFO_H'; \
-	  echo '#define GENERATED_AUDIO_INFO_H'; \
-	  echo "#define PCFX_MP2_AUDIO_SIZE $${sz}u"; \
-	  echo '#endif'; } > $@
-
-encode: $(STREAM) $(AUDIO_MP2) $(AUDIO_INFO)
-audio: $(AUDIO_MP2) $(AUDIO_INFO)
-
-$(OBJDIR)/main.o: src/main.c $(wildcard lbas.h) $(AUDIO_INFO) | $(OBJDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OBJDIR)/pcfx_pcfv_player.o: src/pcfx_pcfv_player.c src/pcfx_pcfv_player.h src/pcfx_mp2_async.h $(ROOT)/include/pcfv_format.h | $(OBJDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OBJDIR)/pcfx_mp2_async.o: src/pcfx_mp2_async.c src/pcfx_mp2_async.h src/kjmp2_fast.h src/psg_sample.h | $(OBJDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OBJDIR)/kjmp2_fast.o: src/kjmp2_fast.c src/kjmp2_fast.h | $(OBJDIR)
-	$(CC) $(CFLAGS) -fno-unroll-loops -c $< -o $@
-
-$(OBJDIR)/psg_sample.o: src/psg_sample.c src/psg_sample.h src/kjmp2_fast.h | $(OBJDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(ELF): $(OBJS)
-	$(LD) $(LDFLAGS) $^ $(LIBS) -o $@ -Map $(MAP)
-
-$(BIN): $(ELF)
+$(OBJDIR)/$(TARGET).program.bin: $(OBJDIR)/$(TARGET).elf
 	$(OBJCOPY) -O binary $< $@
 
-$(CDLINK): $(BIN) $(STREAM) | $(OBJDIR)
-	@{ \
-		echo "binary $(BIN)"; \
-		echo "lbaheader lbas.h"; \
-		echo "name RBOW MP2I"; \
-		echo "maker ChatGPT"; \
-		echo "makerid CGT"; \
-		echo "country JP"; \
-		echo "version 02"; \
-		echo "date 20260622"; \
-		echo "append $(STREAM)"; \
-	} > $@
+program: $(OBJDIR)/$(TARGET).program.bin
 
-cd: clean-output $(STREAM) $(AUDIO_MP2) $(AUDIO_INFO) $(PCFX_CDLINK)
-	$(MAKE) clean-build
-	$(MAKE) $(BIN)
-	$(MAKE) $(CDLINK)
-	$(PCFX_CDLINK) $(CDLINK) $(TARGET)
-	$(MAKE) clean-build
-	$(MAKE) $(BIN)
-	$(MAKE) $(CDLINK)
-	$(PCFX_CDLINK) $(CDLINK) $(TARGET)
-	$(MAKE) clean-build
-	$(MAKE) $(BIN)
-	$(MAKE) $(CDLINK)
-	$(PCFX_CDLINK) $(CDLINK) $(TARGET)
+cd:
+	$(PYTHON) tools/build_disc.py --stream "$(STREAM)" --cdlink "$(PCFX_CDLINK)" --make "$(MAKE)"
 
-clean-build:
-	rm -f $(OBJDIR)/*.o $(ELF) $(BIN) $(MAP) $(CDLINK)
+test:
+	$(PYTHON) $(ROOT)/tools/rainbow/test_rainbow.py
 
-clean-output:
-	rm -f $(TARGET).cue $(TARGET).bin lbas.h
+# Needs PCFX_BIOS_DIR.  Pass VIDEO_IN to add A/V, pitch and picture checks.
+validate:
+	$(PYTHON) tools/emu_validate.py --stream "$(STREAM)" $(if $(VIDEO_IN),--source "$(VIDEO_IN)",)
 
+# Never delete source movies or encoded assets from clean.
 clean:
-	rm -rf $(OBJDIR) $(TARGET).cue $(TARGET).bin lbas.h $(STREAM) $(VIDEO_ONLY_STREAM) $(AUDIO_MP2)
+	rm -f $(OBJS) $(OBJDIR)/$(TARGET).elf $(OBJDIR)/$(TARGET).map \
+	  $(OBJDIR)/$(TARGET).program.bin $(OBJDIR)/cdlink.txt $(OBJDIR)/lbas.h \
+	  $(TARGET).bin $(TARGET).cue
